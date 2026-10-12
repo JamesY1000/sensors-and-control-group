@@ -1,0 +1,48 @@
+<mujoco model="TurtleBot3 practice room">
+  <include file="../robot_model/turtlebot3_waffle/turtlebot3_waffle_pi.xml"/>
+  <!-- Resolve the robot meshes when this scene is loaded from world/. -->
+  <compiler meshdir="../robot_model/turtlebot3_waffle/assets/"/>
+
+  <statistic center="2 0 0.3" extent="4.5"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="135" elevation="-55"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
+      markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+  </asset>
+
+  <worldbody>
+    <light pos="2 0 3" dir="0 0 -1" directional="true"/>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+
+    <!-- Interior: 6 m along X (-1 to 5), 4 m along Y (-2 to 2).
+         The robot starts at (0, 0), facing +X. All room geoms are fixed.
+         Box size values are HALF the full dimensions, in metres. -->
+    <geom name="wall_west" type="box" pos="-1.05 0 0.4" size="0.05 2 0.4"
+      rgba="0.72 0.75 0.8 1"/>
+    <geom name="wall_east" type="box" pos="5.05 0 0.4" size="0.05 2 0.4"
+      rgba="0.72 0.75 0.8 1"/>
+    <geom name="wall_north" type="box" pos="2 2.05 0.4" size="3.1 0.05 0.4"
+      rgba="0.72 0.75 0.8 1"/>
+    <geom name="wall_south" type="box" pos="2 -2.05 0.4" size="3.1 0.05 0.4"
+      rgba="0.72 0.75 0.8 1"/>
+
+    <!-- Low obstacles, all taller than the LiDAR scan plane (~0.126 m).
+         Leave space around both sides of the first box and at the far end
+         of the room for a future charging station. -->
+    <geom name="box_front" type="box" pos="1.5 0 0.15" size="0.25 0.35 0.15"
+      rgba="0.2 0.5 0.8 1"/>
+    <geom name="box_left" type="box" pos="2.8 1.05 0.2" size="0.35 0.25 0.2"
+      rgba="0.9 0.5 0.15 1"/>
+    <!-- Cylinder size is radius and half-height: 0.44 m diameter, 0.35 m tall. -->
+    <geom name="cylinder_right" type="cylinder" pos="3 -0.95 0.175" size="0.22 0.175"
+      rgba="0.2 0.65 0.4 1"/>
+  </worldbody>
+</mujoco>
