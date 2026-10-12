@@ -44,7 +44,20 @@
       <geom size="0.005" pos="-0.177 0.064 0.005" type="sphere" material="grey" friction="0.0001 0.0001 0.0001" solref="0.02 1" solimp="0.95 0.99 0.001" condim="1"/>
       <geom pos="-0.049 0 0.1255" mesh="lds" material="black" class="visual"/>
       <geom pos="-0.049 0 0.1255" mesh="lds" class="collision"/>
+      <!-- 360 horizontal rays from the LiDAR housing. Angles are radians:
+           start forward (+X), then turn counterclockwise in 1-degree steps.
+           Sites stay on the base body so the housing does not block its rays. -->
+      <frame pos="-0.049 0 0.1255">
+        <replicate count="360" euler="0 0 0.0174532925199433">
+          <site name="lidar_ray" size="0.002" zaxis="1 0 0" rgba="0 0.8 0.8 1"/>
+        </replicate>
+      </frame>
       <geom size="0.0075 0.015 0.0135" pos="0.078 0 0.107" type="box" material="grey"/>
+      <!-- Raspberry Pi Camera v2: vertical FOV is in degrees even with angle="radian".
+           Optical centre from ROBOTIS Waffle Pi URDF, expressed in this base frame.
+           MuJoCo camera looks along -Z: image right is -base Y, image up is +base Z. -->
+      <camera name="pi_camera_v2" mode="fixed" pos="0.076 0 0.103"
+        xyaxes="0 -1 0 0 0 1" fovy="48.8"/>
       <body name="wheel_left" pos="0 0.144 0.033" quat="0.707388 -0.706825 0 0">
         <inertial pos="0 0 0" quat="-0.000890159 0.706886 0.000889646 0.707326" mass="0.0284989" diaginertia="2.07126e-05 1.11924e-05 1.11756e-05"/>
         <joint name="wheel_left" class="wheel_left"/>
@@ -64,6 +77,14 @@
     <velocity class="wheel_left" name="wheel_left" joint="wheel_left"/>
     <velocity class="wheel_right" name="wheel_right" joint="wheel_right"/>
   </actuator>
+
+  <!-- Wheel encoder angles in radians. Store std (in rads) foruse by sensing.py -->
+  <sensor>
+    <jointpos name="wheel_left_encoder" joint="wheel_left" noise="0.01"/>
+    <jointpos name="wheel_right_encoder" joint="wheel_right" noise="0.01"/>
+    <!-- Lidar specs from Robotis LDS-02 0.2 s (5 Hz) -->
+    <rangefinder name="lidar_range" site="lidar_ray" nsample="1" interval="0.2"/>
+  </sensor>
 
   <contact>
     <exclude body1="base" body2="wheel_left"/>

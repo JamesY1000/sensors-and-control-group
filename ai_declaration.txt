@@ -1,0 +1,12 @@
+Declaration for use of generative AI to help with this assignment
+
+James Y:
+- Codex helped with initial simulation world setup and stepping through each time tick with sensor updates 
+- Helped with adding sensor configs to turtlebot3 xml and reading the sensor data
+- Assist with linux display configuration using wayland x11
+
+
+Nikhil K:
+
+
+James B:
