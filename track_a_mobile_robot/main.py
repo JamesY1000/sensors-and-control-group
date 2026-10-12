@@ -15,7 +15,7 @@ if sys.platform == "linux" and os.environ.get("DISPLAY"):
 import mujoco
 
 
-SCENE = Path(__file__).resolve().parents[1] / "world/scene_turtlebot3_waffle_pi.xml"
+SCENE = Path(__file__).resolve().parents[1] / "world/room_with_charger.xml"
 
 
 def main() -> None:

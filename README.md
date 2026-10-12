@@ -32,7 +32,7 @@ It uses MuJoCo's managed viewer, which handles physics stepping and rendering.
 
 ## Which file does what?
 
-- `world/scene_turtlebot3_waffle_pi.xml` is the world entry point: robot include,
+- `world/room_with_charger.xml` is the world entry point: robot include,
   mesh directory, lighting, floor, textures and initial viewing settings.
 - `robot_model/turtlebot3_waffle/turtlebot3_waffle_pi.xml` is the unchanged
   upstream robot: bodies, mass/inertia, wheel joints, actuators and geometry.
