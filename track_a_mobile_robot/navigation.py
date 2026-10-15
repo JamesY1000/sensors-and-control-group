@@ -110,8 +110,8 @@ def _pose_array(pose: ArrayLike, name: str) -> np.ndarray:
 def obstacle_avoidance(
     robot_pose: np.ndarray,
     target_pose: np.ndarray,
-    obstacles: list[np.ndarray],
-    circulation: float = 0.0) -> list[np.ndarray]:
+    obstacles: ArrayLike,
+    circulation: float = 0.0) -> np.ndarray:
     """Choose the next safe waypoint with a reactive artificial potential field.
 
     Attractive, repulsive, and tangential forces guide each waypoint. The
@@ -121,13 +121,13 @@ def obstacle_avoidance(
     start already inside this clearance may leave only along a segment that
     moves monotonically away from it.
 
-    Returns ``[start, target]`` when the straight segment is clear, otherwise
-    ``[start, waypoint]`` with the waypoint one APF step away.
+    Returns ``target_pose`` when the straight segment is clear, otherwise the
+    waypoint one APF step away, with its heading pointing along that step.
 
     Args:
         robot_pose: The current pose of the robot (x, y, theta).
         target_pose: The desired target pose (x, y, theta).
-        obstacles: A list of obstacle centers (x, y).
+        obstacles: Obstacle centers, shape (N, 2).
         circulation: +1 to pass obstacles counterclockwise, -1 clockwise, 0
             to always choose per obstacle point from the goal direction. The
             fixed sense is used only for points nearly straight ahead, where
@@ -170,12 +170,11 @@ def obstacle_avoidance(
         raise ValueError("The target is inside the obstacle clearance area.")
 
     if segment_is_clear(start[:2], goal[:2]):
-        return [start.copy(), goal.copy()]
+        return goal.copy()
+    # From here on there is at least one obstacle (otherwise the line is clear).
 
     def segment_escapes_clearance(point_a: np.ndarray, point_b: np.ndarray) -> bool:
         """Allow an initially close pose to move only monotonically away."""
-        if not len(obstacle_points):
-            return True
         displacement = point_b - point_a
         initial_offsets = point_a - obstacle_points
         initial_distances = np.linalg.norm(initial_offsets, axis=1)
@@ -216,49 +215,47 @@ def obstacle_avoidance(
     goal_distance = float(np.linalg.norm(goal_offset))
     attractive_force = goal_offset / goal_distance
     repulsive_force = np.zeros(2)
-    start_distances = np.linalg.norm(obstacle_points - current, axis=1)
+    offsets = current - obstacle_points
+    start_distances = np.linalg.norm(offsets, axis=1)
     start_inside_clearance = bool(
         np.any(start_distances < _OBSTACLE_CLEARANCE_M)
     )
 
-    if len(obstacle_points):
-        offsets = current - obstacle_points
-        distances = np.linalg.norm(offsets, axis=1)
-        influenced = (
-            (distances < _APF_INFLUENCE_DISTANCE_M)
-            & (distances > 1e-12)
+    influenced = (
+        (start_distances < _APF_INFLUENCE_DISTANCE_M)
+        & (start_distances > 1e-12)
+    )
+    if np.any(influenced):
+        influenced_distances = start_distances[influenced]
+        repulsive_magnitudes = (
+            _APF_REPULSIVE_GAIN
+            * (
+                1.0 / influenced_distances
+                - 1.0 / _APF_INFLUENCE_DISTANCE_M
+            )
+            / influenced_distances**2
         )
-        if np.any(influenced):
-            influenced_distances = distances[influenced]
-            repulsive_magnitudes = (
-                _APF_REPULSIVE_GAIN
-                * (
-                    1.0 / influenced_distances
-                    - 1.0 / _APF_INFLUENCE_DISTANCE_M
-                )
-                / influenced_distances**2
+        obstacle_directions = offsets[influenced] / influenced_distances[:, None]
+        tangential_directions = np.column_stack((
+            -obstacle_directions[:, 1],
+            obstacle_directions[:, 0],
+        ))
+        tangent_alignment = tangential_directions @ attractive_force
+        tangent_signs = np.where(tangent_alignment < 0.0, -1.0, 1.0)
+        if circulation:
+            tangent_signs = np.where(
+                np.abs(tangent_alignment) < _APF_AMBIGUOUS_ALIGNMENT,
+                math.copysign(1.0, circulation),
+                tangent_signs,
             )
-            obstacle_directions = offsets[influenced] / influenced_distances[:, None]
-            tangential_directions = np.column_stack((
-                -obstacle_directions[:, 1],
-                obstacle_directions[:, 0],
-            ))
-            tangent_alignment = tangential_directions @ attractive_force
-            tangent_signs = np.where(tangent_alignment < 0.0, -1.0, 1.0)
-            if circulation:
-                tangent_signs = np.where(
-                    np.abs(tangent_alignment) < _APF_AMBIGUOUS_ALIGNMENT,
-                    math.copysign(1.0, circulation),
-                    tangent_signs,
-                )
-            tangential_directions *= tangent_signs[:, None]
-            repulsive_force = np.sum(
-                repulsive_magnitudes[:, None] * (
-                    obstacle_directions
-                    + _APF_TANGENTIAL_GAIN * tangential_directions
-                ),
-                axis=0,
-            )
+        tangential_directions *= tangent_signs[:, None]
+        repulsive_force = np.sum(
+            repulsive_magnitudes[:, None] * (
+                obstacle_directions
+                + _APF_TANGENTIAL_GAIN * tangential_directions
+            ),
+            axis=0,
+        )
 
     resultant = attractive_force + repulsive_force
     resultant_magnitude = float(np.linalg.norm(resultant))
@@ -312,9 +309,9 @@ def obstacle_avoidance(
         candidate = best_candidate
 
     if np.linalg.norm(candidate - goal[:2]) <= 1e-12:
-        return [start.copy(), goal.copy()]
+        return goal.copy()
     heading = math.atan2(candidate[1] - current[1], candidate[0] - current[0])
-    return [start.copy(), np.array([candidate[0], candidate[1], heading])]
+    return np.array([candidate[0], candidate[1], heading])
 
 
 @dataclass(frozen=True)
@@ -477,23 +474,21 @@ class Navigator:
         def point(xy: np.ndarray) -> str:
             return f"({xy[0]:.2f}, {xy[1]:.2f})"
 
-        if self._phase is _Phase.SEARCH and self._goal is not None:
+        if self._phase is _Phase.SEARCH:
             end = "far" if self._toward_far_end else "near"
             return f"searching: driving to the {end} end of the room {point(self._goal)}"
-        if self._phase is _Phase.TO_STAGING and self._staging_pose is not None:
+        if self._phase is _Phase.TO_STAGING:
             if self._detour_goal is not None:
                 return f"marker approach blocked: detouring via {point(self._detour_goal)}"
             return f"marker seen: driving to staging point {point(self._staging_pose)}"
-        if self._phase is _Phase.FINAL and self._final_pose is not None:
+        if self._phase is _Phase.FINAL:
             return f"docking along the marker normal to {point(self._final_pose)}"
-        if self._phase is _Phase.DONE:
-            return "docked at the marker: stopped"
-        return self._phase.name.lower()
+        return "docked at the marker: stopped"
 
     def _report_state(self, time: float, estimated: np.ndarray) -> None:
         """Print one console line whenever the navigation state changes."""
-        if not self._verbose:
-            return
+        if not self._verbose or (self._phase is _Phase.SEARCH and self._goal is None):
+            return  # between search goals for one tick; the next goal is reported
         description = self._state_description()
         if description == self._reported_state:
             return
@@ -637,9 +632,7 @@ class Navigator:
         if obstacles is not None:
             if self._circulation == 0.0:
                 self._circulation = self._choose_circulation(estimated, goal, obstacles)
-            waypoint = obstacle_avoidance(
-                estimated, goal, list(obstacles), self._circulation,
-            )[1]
+            waypoint = obstacle_avoidance(estimated, goal, obstacles, self._circulation)
             if np.allclose(waypoint[:2], goal[:2]):
                 self._circulation = 0.0  # clear line: choose afresh next time
             else:
@@ -666,17 +659,14 @@ class Navigator:
             self._start_segment(time, line_start)
         segment = goal[:2] - self._segment_start
         length = float(np.linalg.norm(segment))
-        robot_progress = (
-            float(np.dot(estimated[:2] - self._segment_start, segment)) / length
-            if length > 1e-9 else length
-        )
+        if length <= 1e-9:
+            return self._hold(time, estimated)
+        robot_progress = float(np.dot(estimated[:2] - self._segment_start, segment)) / length
         if robot_progress >= length and start is None:
             # Passed the goal without arriving (e.g. lateral offset): restart
             # the segment from here so the robot turns back toward the goal.
             self._segment_start = None
             return self._follow(time, estimated, goal, obstacles, dock=dock)
-        if length <= 1e-9:
-            return self._hold(time, estimated)
 
         elapsed = max(0.0, time - self._follow_time)
         self._follow_time = time
@@ -752,8 +742,15 @@ class Navigator:
     def _detour_goal_from_scan(
         estimated: np.ndarray,
         obstacles: np.ndarray,
+        toward_xy: np.ndarray,
     ) -> np.ndarray | None:
-        """Pick the farthest reachable LiDAR-derived point, to escape a blocked approach."""
+        """Pick a reachable LiDAR-derived point to escape a blocked approach.
+
+        Candidates lie along LiDAR rays, short of the hit point by the wall
+        standoff and clear of obstacles; the one nearest ``toward_xy`` (the
+        staging point) wins, so the detour makes progress instead of leading
+        away from the marker.
+        """
         if not len(obstacles):
             return None
         offsets = obstacles - estimated[:2]
@@ -771,7 +768,7 @@ class Navigator:
         goals = goals[clearances >= _OBSTACLE_CLEARANCE_M]
         if not len(goals):
             return None
-        goal_xy = goals[int(np.argmax(np.linalg.norm(goals - estimated[:2], axis=1)))]
+        goal_xy = goals[int(np.argmin(np.linalg.norm(goals - toward_xy, axis=1)))]
         heading = math.atan2(goal_xy[1] - estimated[1], goal_xy[0] - estimated[0])
         return np.array([goal_xy[0], goal_xy[1], heading])
 
@@ -844,7 +841,6 @@ class Navigator:
         self._approach_normal = normal
         self._staging_pose = np.array([staging_xy[0], staging_xy[1], heading])
         self._final_pose = np.array([final_xy[0], final_xy[1], heading])
-        self._goal = None
         self._set_phase(_Phase.TO_STAGING)
 
     def _start_final(self, start_xy: np.ndarray) -> None:
@@ -898,9 +894,11 @@ class Navigator:
                 return self._follow(time, estimated, target, obstacles)
             except ValueError:
                 pass
-        # Stuck or blocked: detour via an exploration goal, then retry staging.
+        # Stuck or blocked: detour toward the staging point, then retry it.
         if self._detour_goal is None:
-            self._detour_goal = self._detour_goal_from_scan(estimated, obstacles)
+            self._detour_goal = self._detour_goal_from_scan(
+                estimated, obstacles, self._staging_pose[:2],
+            )
         else:
             self._detour_goal = None
         self._set_phase(_Phase.TO_STAGING)
