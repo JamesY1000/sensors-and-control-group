@@ -14,11 +14,26 @@ facing +X, with space to drive around the obstacles.
 
 LiDAR and camera measurements are ideal; their noise and other hardware effects
 are not modelled yet. Camera resolution and frame rate are simulation choices.
-The launcher reports encoder readings at startup and completion, prints LiDAR
-summaries, and can save a camera image.
+The pose EKF samples the wheel angles at a chosen **50 Hz** and predicts
+`[x, y, yaw]` and its 3×3 covariance. It runs in both viewer and headless modes,
+printing the pose, standard deviations and an evaluation-only comparison with simulator truth once
+per simulation second and at completion. It starts from the room's known
+`(0, 0, 0)` pose; resetting simulation time starts a new encoder baseline.
+The launcher also prints LiDAR summaries and can save a camera image.
 
-Navigation, state estimation and feedback control are not implemented yet.
+Prediction uses noisy encoders by default. Camera-pose correction is implemented
+in `PoseEKF.correct()`, but camera localisation is not connected yet, so current
+simulation runs remain encoder-only. Navigation and feedback control remain to be added.
+Even ideal encoders can show pose error because the kinematic model approximates
+MuJoCo's physical motion.
 There is no charging station or ArUco marker yet, despite the world filename.
+
+Initial pose standard deviations are **1 cm, 1 cm, 2°**. Additional motion-model
+noise uses **1 cm/√s, 1 cm/√s, 5°/√s**; these are starter assumptions to tune in
+`main.py`, not calibrated uncertainty. Encoder angle noise comes from the XML
+(zero with `--ideal-encoders`); ideal encoders still retain motion-model uncertainty.
+The filter maps wheel-increment variance `2σ²` into pose covariance. This is an
+approximation that ignores correlation between consecutive angle differences.
 
 ## Run the simulation
 
@@ -58,6 +73,9 @@ python3 -m track_a_mobile_robot.main --headless --seconds 2
 # Apply equal wheel velocity targets for a short forward-motion check.
 python3 -m track_a_mobile_robot.main --headless --seconds 2 --left-wheel 4 --right-wheel 4
 
+# Check encoder-only odometry with clean readings first.
+python3 -m track_a_mobile_robot.main --headless --seconds 2 --left-wheel 4 --right-wheel 4 --ideal-encoders
+
 # Sample the camera and save its latest frame as a PNG.
 python3 -m track_a_mobile_robot.main --headless --seconds 2 --camera-output outputs/pi_camera_v2.png
 ```
@@ -81,7 +99,20 @@ Generated images are saved under `outputs/`, which Git ignores.
   viewer/headless execution and command-line options.
 - `track_a_mobile_robot/sensing.py`: encoder and LiDAR readings, RGB capture
   and camera calibration.
-- The remaining algorithm modules are placeholders for later work.
+- `track_a_mobile_robot/state_model.py`: wheel geometry, midpoint pose prediction
+  and its Jacobians for covariance propagation.
+- `track_a_mobile_robot/estimation.py`: `PoseEKF.predict()` / `correct()` and
+  `StateEstimate` snapshots containing timestamp, world pose and covariance.
+- `track_a_mobile_robot/evaluation.py`: simulator truth and pose-error calculations,
+  used only for reporting results.
+- Navigation and control modules are placeholders for later work.
+
+The future perception connection is `correct(camera_pose_world, camera_covariance,
+time)`: supply the robot's world-frame `(x, y, yaw)` and a positive-definite 3×3
+measurement covariance in that order. Predict to the image capture time first;
+correction rejects mismatched timestamps and repeated frames. The 30 Hz camera
+and 50 Hz encoder schedules will need alignment when perception is connected.
+If no marker pose is available, continue prediction without correction.
 
 ## Model source
 

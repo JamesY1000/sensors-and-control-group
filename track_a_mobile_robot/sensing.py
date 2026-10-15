@@ -1,5 +1,7 @@
 """Read the project's simulated sensors without using the robot's world pose."""
 
+# Read simulated sensors, apply configured measurement noise, and return timestamped readings.
+
 from dataclasses import dataclass
 
 import mujoco
