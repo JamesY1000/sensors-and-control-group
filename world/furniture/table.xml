@@ -1,0 +1,27 @@
+<mujoco model="Static rectangular table">
+  <compiler angle="radian"/>
+
+  <asset>
+    <material name="table_wood" rgba="0.63 0.45 0.28 1" specular="0.15" shininess="0.1"/>
+    <material name="table_metal" rgba="0.16 0.18 0.20 1" specular="0.25" shininess="0.2"/>
+  </asset>
+
+  <worldbody>
+    <!-- Ground-centred frame: length along +X, width along +Y, +Z up.
+         Overall dimensions: 1.40 x 0.80 x 0.75 m.
+         Visible boxes are also the collision shapes; the space below the
+         tabletop stays open except for the four 0.06 m square legs. -->
+    <body name="table" pos="0 0 0">
+      <geom name="top" type="box" pos="0 0 0.73"
+        size="0.70 0.40 0.02" material="table_wood"/>
+      <geom name="leg_front_left" type="box" pos="0.61 0.31 0.355"
+        size="0.03 0.03 0.355" material="table_metal"/>
+      <geom name="leg_front_right" type="box" pos="0.61 -0.31 0.355"
+        size="0.03 0.03 0.355" material="table_metal"/>
+      <geom name="leg_back_left" type="box" pos="-0.61 0.31 0.355"
+        size="0.03 0.03 0.355" material="table_metal"/>
+      <geom name="leg_back_right" type="box" pos="-0.61 -0.31 0.355"
+        size="0.03 0.03 0.355" material="table_metal"/>
+    </body>
+  </worldbody>
+</mujoco>

@@ -1,0 +1,19 @@
+# Planar starting poses in the room's world frame. Distances are metres.
+# yaw_deg: 0 faces +X (east), 90 faces +Y (north), 180 faces -X (west).
+# Restart the simulation after editing. Viewer reset restores these poses.
+# Room interior: -1 <= x <= 7, -3 <= y <= 3. Allow clearance for each footprint.
+
+# Bottom-right corner in the room preview (world southwest), 0.5 m from each wall.
+# Face diagonally into the room.
+[robot]
+x = -0.5
+y = -2.5
+yaw_deg = 45.0
+
+# The dock and its elevated ArUco panel move together as one fixed assembly.
+# This is the dock's ground-level origin, not the desired robot docking pose.
+# +X in the dock's local frame points out of its front, towards the approaching robot.
+[charger]
+x = 6.9
+y = 0.0
+yaw_deg = 180.0

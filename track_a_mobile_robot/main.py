@@ -20,6 +20,7 @@ import numpy as np
 
 from .estimation import PoseEKF, StateEstimate
 from .evaluation import pose_error, read_true_pose
+from .scene_config import DEFAULT_CONFIG, SceneConfig, load_config
 from .sensing import (
     CAMERA_FPS,
     CAMERA_HEIGHT,
@@ -36,22 +37,30 @@ from .state_model import DifferentialDriveModel
 SCENE = Path(__file__).resolve().parents[1] / "world/room_with_charger.xml"
 # Chosen encoder sampling rate for pose prediction.
 ENCODER_HZ = 50
-# Known configured start of this scene, not a live simulator pose measurement.
-INITIAL_POSE = (0.0, 0.0, 0.0)
 # Starting assumptions, not calibrated values: [x metres, y metres, yaw radians].
 INITIAL_POSE_STD = (0.01, 0.01, math.radians(2.0))
 # Motion-model uncertainty growth [m/sqrt(s), m/sqrt(s), rad/sqrt(s)].
 PROCESS_NOISE_STD_PER_SQRT_S = (0.01, 0.01, math.radians(5.0))
 
 
-def load_model(path: str | Path) -> mujoco.MjModel:
-    """Expand the XML beam array, then add a clock with the same sampling rate.
+def load_spec(path: str | Path = SCENE, config: SceneConfig | None = None) -> mujoco.MjSpec:
+    """Apply configured starting poses and add the LiDAR sampling clock.
 
     MuJoCo 3.15 recursively duplicates an unreferenced XML clock during
     replication. Adding it after parsing avoids that model-loading problem.
     The rangefinders and their sampling interval remain defined in robot XML.
+    Applying poses before compilation also makes viewer resets restore them.
     """
+    config = load_config() if config is None else config
     spec = mujoco.MjSpec.from_file(str(path))
+    for name, pose in (("base", config.robot), ("charging_station", config.charger)):
+        body = spec.body(name)
+        if body is None:
+            raise ValueError(f"Scene is missing body {name!r}")
+        # Preserve the model's ground height; only planar placement is configurable.
+        body.pos = [pose.x, pose.y, body.pos[2]]
+        body.quat = pose.quaternion
+        body.alt.type = mujoco.mjtOrientation.mjORIENTATION_QUAT
     first_beam = spec.sensor("lidar_range000")
     spec.add_sensor(
         name="lidar_time",
@@ -59,7 +68,12 @@ def load_model(path: str | Path) -> mujoco.MjModel:
         nsample=first_beam.nsample,
         interval=first_beam.interval,
     )
-    return spec.compile()
+    return spec
+
+
+def load_model(path: str | Path = SCENE, config: SceneConfig | None = None) -> mujoco.MjModel:
+    """Compile the scene with the supplied configuration (or config/scene.toml)."""
+    return load_spec(path, config).compile()
 
 
 def print_lidar(reading: LidarReading) -> None:
@@ -103,6 +117,10 @@ def print_estimate(estimate: StateEstimate, data: mujoco.MjData) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Open the TurtleBot3 world with encoders, LiDAR and an RGB camera.")
+    parser.add_argument(
+        "--config", type=Path, default=DEFAULT_CONFIG,
+        help="Scene starting poses in TOML (default: config/scene.toml in the repository).",
+    )
     parser.add_argument("--headless", action="store_true", help="Check physics without opening a viewer.")
     parser.add_argument("--seconds", type=float, default=2.0, help="Duration of a headless check (default: 2 s).")
     parser.add_argument("--left-wheel", type=float, default=0.0, help="Left wheel velocity target [rad/s].")
@@ -125,7 +143,11 @@ def main() -> None:
         parser.error("--camera-output requires --headless")
 
     rng = np.random.default_rng(args.seed)
-    model = load_model(SCENE)
+    try:
+        config = load_config(args.config)
+    except ValueError as error:
+        parser.error(str(error))
+    model = load_model(SCENE, config)
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
     for name, target in (("wheel_left", args.left_wheel), ("wheel_right", args.right_wheel)):
@@ -136,6 +158,9 @@ def main() -> None:
         data.ctrl[actuator.id] = target
 
     print(f"Loaded: {SCENE}", flush=True)
+    print(f"Scene config: {args.config.resolve()}", flush=True)
+    for name, pose in (("Robot", config.robot), ("Charger + marker", config.charger)):
+        print(f"{name} start: x={pose.x:g} m, y={pose.y:g} m, yaw={pose.yaw_deg:g} deg", flush=True)
     print(f"Wheel actuators: {model.nu}; sensor definitions: {model.nsensor}; "
           f"robot cameras: {model.ncam}", flush=True)
     print(f"Wheel targets [rad/s]: left={args.left_wheel:g}, right={args.right_wheel:g}", flush=True)
@@ -155,7 +180,7 @@ def main() -> None:
     def new_estimator() -> PoseEKF:
         """Use the same initial pose and uncertainty after a viewer reset."""
         return PoseEKF(
-            drive_model, INITIAL_POSE, np.diag(np.square(INITIAL_POSE_STD)),
+            drive_model, config.robot.pose_world, np.diag(np.square(INITIAL_POSE_STD)),
             encoder_noise_std_rad=encoder_std,
             process_noise_covariance_per_s=np.diag(np.square(PROCESS_NOISE_STD_PER_SQRT_S)),
         )

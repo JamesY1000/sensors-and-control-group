@@ -1,8 +1,10 @@
 # Sensors and Control — Track A
 
-A MuJoCo simulation of the **TurtleBot3 Waffle Pi** in a **6 × 4 m room** with
-three fixed obstacles: two boxes and a cylinder. The robot starts at (0, 0),
-facing +X, with space to drive around the obstacles.
+A MuJoCo simulation of the **TurtleBot3 Waffle Pi** in an **8 × 6 m room** with
+two tables and four chairs as fixed obstacles, plus a **Create 3 charging dock
+with an elevated ArUco panel**. By default the robot starts at (−0.5, −2.5),
+in the southwest corner, facing northeast (45°) into the room. The dock is near
+the east wall, facing -X. Both starting poses are configurable.
 
 ## Current capabilities
 
@@ -17,8 +19,8 @@ are not modelled yet. Camera resolution and frame rate are simulation choices.
 The pose EKF samples the wheel angles at a chosen **50 Hz** and predicts
 `[x, y, yaw]` and its 3×3 covariance. It runs in both viewer and headless modes,
 printing the pose, standard deviations and an evaluation-only comparison with simulator truth once
-per simulation second and at completion. It starts from the room's known
-`(0, 0, 0)` pose; resetting simulation time starts a new encoder baseline.
+per simulation second and at completion. It starts from the configured, known
+robot pose; resetting simulation time restores that pose and starts a new encoder baseline.
 The launcher also prints LiDAR summaries and can save a camera image.
 
 Prediction uses noisy encoders by default. Camera-pose correction is implemented
@@ -26,7 +28,9 @@ in `PoseEKF.correct()`, but camera localisation is not connected yet, so current
 simulation runs remain encoder-only. Navigation and feedback control remain to be added.
 Even ideal encoders can show pose error because the kinematic model approximates
 MuJoCo's physical motion.
-There is no charging station or ArUco marker yet, despite the world filename.
+The station is fixed to the world and contains the original Create 3 visual
+mesh, a simple housing collision box, and a supported marker panel above it.
+Docking control and electrical charging behaviour are not implemented.
 
 Initial pose standard deviations are **1 cm, 1 cm, 2°**. Additional motion-model
 noise uses **1 cm/√s, 1 cm/√s, 5°/√s**; these are starter assumptions to tune in
@@ -90,15 +94,122 @@ available. Physics-only headless checks need no graphics context. The viewer's
 refresh rate is independent of the Python camera's 30 Hz capture rate.
 Generated images are saved under `outputs/`, which Git ignores.
 
+## Configure the starting positions
+
+Edit **`config/scene.toml`**, then restart the simulation:
+
+```toml
+[robot]
+x = -0.5
+y = -2.5
+yaw_deg = 45.0
+
+[charger]
+x = 6.9
+y = 0.0
+yaw_deg = 180.0
+```
+
+`x` and `y` are world coordinates in **metres**; `yaw_deg` is counterclockwise
+heading in **degrees**. Zero points along +X (east), 90 along +Y (north), and
+180 along -X (west). Robot heading points forward; charger heading points out
+of the dock's front towards an approaching robot. Its position is the dock's
+ground-level model origin, not the desired final robot pose.
+
+The charger, post, panel and marker frame form one assembly, so they translate
+and rotate together. Ground height and marker mounting geometry stay in the
+MJCF model. Choose clear floor space inside the room, allowing for each object's
+footprint; configuration validates field names and finite numbers, not collisions
+or whether a position is reachable.
+
+TOML supports comments and is read by Python's standard library. No YAML package
+is needed. `scene_config.py` reads it; `main.py` applies the poses before MuJoCo
+compiles the scene and uses the same robot pose to initialise the EKF. Viewer
+reset restores the configured poses. To keep several layouts, copy the file and run:
+
+```bash
+python3 -m track_a_mobile_robot.main --config config/my_layout.toml
+```
+
+The default file is found relative to the repository, independent of the current
+directory. An explicit `--config` path is relative to your current directory.
+Loading the XML directly in a separate MuJoCo viewer uses its default poses;
+use the Python launcher to apply the TOML configuration.
+
+## Room and furniture
+
+The room interior spans **x = −1 to 7 m** and **y = −3 to 3 m**. Two tables sit
+at (2, 1.55) and (4.5, −1.55), each with two chairs facing the table. The robot
+starts 0.5 m in from the west and south walls, at (−0.5, −2.5). A 0.94 m wide
+strip along y = 0 is free of furniture and leads to the dock at (6.9, 0);
+navigate from the corner into this central approach. The low walls keep the
+scene easy to inspect from above.
+
+Each table is 1.4 × 0.8 m and 0.75 m tall; each chair is 0.46 × 0.44 m and
+0.85 m tall. Separate legs, seats, backs and tabletops have their own collision
+shapes. The low LiDAR scan sees the legs, and the robot can move under furniture
+where its full body fits between the legs and beneath the seat or tabletop.
+Furniture is fixed in place; the robot cannot push it around.
+
+Edit the placement frames in `world/room_with_charger.xml` to rearrange the
+tables and chairs. Their reusable geometry and materials live in
+`world/furniture/table.xml` and `world/furniture/chair.xml`. Robot and dock
+starting poses remain in `config/scene.toml`.
+
+## Marker panel and perception
+
+Keep the **marker on a panel**, including its white margin: ID 0 from
+`DICT_4X4_50`, a **20 cm black square** inside a **28 cm white panel**. The panel
+centre is 26 cm above the floor, above the dock housing, on a narrow support.
+The size of the black square matches `MARKER_SIDE_M` used for pose estimation.
+With the robot's low, forward-facing camera, the raised marker will leave the
+image at sufficiently close range; plan the final docking stage accordingly.
+The central approach has a clear view of the panel. From the default corner
+start, the robot needs to turn towards the dock and approach before the marker
+is large enough in the image for reliable detection.
+
+The marker's installed world pose is derived from the configured model's fixed
+body/site transforms, so changing the dock pose also changes its known landmark
+map. This uses model constants, not a live measurement of the robot's true pose.
+Pass that map explicitly to perception helpers:
+
+```python
+with Perception(model) as perception:
+    observations = perception.update(data)
+    marker_map = perception.marker_map
+    expected = expected_range_bearing(estimated_pose, marker_map=marker_map)
+    # robot_pose_from_marker(observation, marker_map)
+    # range_bearing_jacobian(estimated_pose, marker_map=marker_map)
+```
+
+The diagnostic tools use the same configuration. Put `--config` before the subcommand:
+
+```bash
+MUJOCO_GL=egl python3 -m track_a_mobile_robot.perception --config config/scene.toml test --repeats 3
+```
+
+Regression checks for configured poses, reset behaviour and rendered marker detection:
+
+```bash
+MUJOCO_GL=egl python3 -m unittest discover -s tests -v
+```
+
 ## Key files
 
+- `config/scene.toml`: robot and charger assembly starting positions/headings.
+- `track_a_mobile_robot/scene_config.py`: typed configuration and validation.
 - `world/room_with_charger.xml`: floor, walls, obstacle layout and lighting.
+- `world/furniture/`: reusable table and chair models with individual collision legs.
+- `world/charging_station.xml`: dock, post, marker panel and fixed marker frame.
+- `world/assets/create3_dock/`: dock meshes, source details and retained licence.
 - `robot_model/turtlebot3_waffle/turtlebot3_waffle_pi.xml`: robot geometry,
   joints, actuators and sensor definitions; `assets/` holds its meshes.
 - `track_a_mobile_robot/main.py`: model loading, LiDAR timestamp setup,
   viewer/headless execution and command-line options.
 - `track_a_mobile_robot/sensing.py`: encoder and LiDAR readings, RGB capture
   and camera calibration.
+- `track_a_mobile_robot/perception.py`: ArUco detection, configured landmark map,
+  LiDAR frame transforms and perception diagnostics.
 - `track_a_mobile_robot/state_model.py`: wheel geometry, midpoint pose prediction
   and its Jacobians for covariance propagation.
 - `track_a_mobile_robot/estimation.py`: `PoseEKF.predict()` / `correct()` and
@@ -124,6 +235,13 @@ licence is retained in `robot_model/turtlebot3_waffle/LICENSE`.
 
 Sensor references: [LDS-02](https://emanual.robotis.com/docs/en/platform/turtlebot3/appendix_lds_02/)
 and [Pi Camera v2](https://emanual.robotis.com/docs/en/platform/turtlebot3/appendix_raspi_cam/).
+
+The dock geometry comes from the
+[iRobot Create 3 simulator](https://github.com/iRobotEducation/create3_sim/blob/jazzy/irobot_create_common/irobot_create_description/urdf/dock/standard_dock.urdf.xacro).
+Its BSD-3-Clause licence and conversion notes are retained under
+`world/assets/create3_dock/`. The elevated marker mount is specific to this
+simulation. The Create 3 dock is used as a stationary prop for the Waffle Pi;
+this does not model a compatible real electrical charging interface.
 
 ## Project workflow (quick start)
 

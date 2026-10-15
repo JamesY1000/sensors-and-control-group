@@ -16,9 +16,10 @@ What teammates use
     out.camera              latest CameraReading (30 Hz)
 
     MarkerObservation.range_m, .bearing_rad     EKF measurement z
-    expected_range_bearing(pose)                EKF measurement model h(x)
-    range_bearing_jacobian(pose)                its Jacobian H
-    robot_pose_from_marker(observation)         robot [x, y, theta] from the marker
+    marker_map = perception.marker_map         fixed landmarks from the configured scene
+    expected_range_bearing(pose, marker_map=marker_map)       EKF h(x)
+    range_bearing_jacobian(pose, marker_map=marker_map)        EKF H
+    robot_pose_from_marker(observation, marker_map)           robot [x, y, theta]
     lidar_points_to_world(points, pose)         scan on the map, given a pose ESTIMATE
 
 Frames (4 x 4 transforms; T_a_b maps coordinates in frame b into frame a)
@@ -43,6 +44,7 @@ Command line (run from the repository root)
     python3 -m track_a_mobile_robot.perception test [--repeats 20] [--pixel-noise 2]
     python3 -m track_a_mobile_robot.perception calibrate
     python3 -m track_a_mobile_robot.perception sensitivity
+    python3 -m track_a_mobile_robot.perception --config config/scene.toml test
 On Linux without a display, prefix with MUJOCO_GL=egl.
 """
 
@@ -54,6 +56,7 @@ import cv2
 import mujoco
 import numpy as np
 
+from .scene_config import DEFAULT_CONFIG, SceneConfig, load_config
 from .sensing import (
     CAMERA_HEIGHT,
     CAMERA_NAME,
@@ -75,19 +78,6 @@ MARKER_IMAGE = REPO_ROOT / "world" / "assets" / "marker_0.png"
 
 ARUCO_DICTIONARY = cv2.aruco.DICT_4X4_50
 MARKER_SIDE_M = 0.20            # black square of the printed marker
-
-# Landmark map: where the charger's marker is installed in the world. This is
-# known in advance (like a surveyed landmark), not robot ground truth, so the
-# estimator may use it. Matches site aruco_marker_0 in room_with_charger.xml.
-# Rotation columns are the marker's x, y, z axes expressed in the world.
-MARKER_MAP = {
-    0: np.array([
-        [0.0, 0.0, -1.0, 4.9295],
-        [-1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.16],
-        [0.0, 0.0, 0.0, 1.0],
-    ]),
-}
 
 # LiDAR extrinsic, from the <frame> in the robot XML.
 LIDAR_TO_BASE_XYZ = np.array([-0.049, 0.0, 0.1255])
@@ -122,6 +112,46 @@ def make_transform(rotation: np.ndarray, translation) -> np.ndarray:
     T[:3, :3] = np.asarray(rotation).reshape(3, 3)
     T[:3, 3] = np.asarray(translation).ravel()
     return T
+
+
+def _fixed_body_transform(model: mujoco.MjModel, body_id: int) -> np.ndarray:
+    """World mounting transform from model constants, excluding moving bodies."""
+    ancestors = []
+    while body_id != 0:
+        if model.body_jntnum[body_id] or model.body_mocapid[body_id] != -1:
+            name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+            raise ValueError(f"Landmark ancestor {name!r} is not fixed to the world")
+        ancestors.append(body_id)
+        body_id = int(model.body_parentid[body_id])
+    transform = np.eye(4)
+    for body_id in reversed(ancestors):
+        rotation = np.empty(9)
+        mujoco.mju_quat2Mat(rotation, model.body_quat[body_id])
+        transform = transform @ make_transform(rotation, model.body_pos[body_id])
+    return transform
+
+
+def marker_map_from_model(model: mujoco.MjModel) -> dict[int, np.ndarray]:
+    """Known world poses of fixed ``aruco_marker_<id>`` sites in the scene.
+
+    Reads only installed geometry in MjModel, never MjData or the robot's true
+    pose. The site defines the OpenCV marker frame; moving the configured
+    station therefore moves its surveyed landmark map automatically.
+    """
+    marker_map = {}
+    for site_id in range(model.nsite):
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_SITE, site_id) or ""
+        prefix = "aruco_marker_"
+        if not name.startswith(prefix) or not name[len(prefix):].isdigit():
+            continue
+        marker_id = int(name[len(prefix):])
+        if marker_id in marker_map:
+            raise ValueError(f"Duplicate landmark ID {marker_id} in ArUco site names")
+        T_world_body = _fixed_body_transform(model, int(model.site_bodyid[site_id]))
+        rotation = np.empty(9)
+        mujoco.mju_quat2Mat(rotation, model.site_quat[site_id])
+        marker_map[marker_id] = T_world_body @ make_transform(rotation, model.site_pos[site_id])
+    return marker_map
 
 
 def invert_transform(T: np.ndarray) -> np.ndarray:
@@ -299,20 +329,26 @@ class ArucoLandmarkDetector:
             self.camera_matrix, self.dist_coeffs, flags=cv2.SOLVEPNP_IPPE_SQUARE)
         if count == 0:
             return None
-        errors = np.asarray(errors).ravel()
-        if errors[0] > MAX_REPROJECTION_ERROR_PX:
+        # IPPE can return non-finite solutions for exactly symmetric views.
+        # Never pass one through as a valid observation to the estimator.
+        solutions = [(float(error), rvec, tvec)
+                     for error, rvec, tvec in zip(np.asarray(errors).ravel(), rvecs, tvecs)
+                     if np.isfinite(error) and np.isfinite(rvec).all() and np.isfinite(tvec).all()]
+        solutions.sort(key=lambda solution: solution[0])
+        if not solutions or solutions[0][0] > MAX_REPROJECTION_ERROR_PX:
             return None
-        ambiguity = float(errors[0] / errors[1]) if count > 1 and errors[1] > 0 else 0.0
+        error, rvec, tvec = solutions[0]
+        ambiguity = float(error / solutions[1][0]) if len(solutions) > 1 and solutions[1][0] > 0 else 0.0
 
-        rotation, _ = cv2.Rodrigues(rvecs[0])
-        T_camera_marker = make_transform(rotation, tvecs[0])
+        rotation, _ = cv2.Rodrigues(rvec)
+        T_camera_marker = make_transform(rotation, tvec)
         T_base_marker = self.T_base_camera @ T_camera_marker       # frame chain
         x, y = T_base_marker[0, 3], T_base_marker[1, 3]
         return MarkerObservation(
             time=time, marker_id=marker_id,
             range_m=float(np.hypot(x, y)), bearing_rad=float(np.arctan2(y, x)),
             T_camera_marker=T_camera_marker, T_base_marker=T_base_marker,
-            reprojection_error_px=float(errors[0]), ambiguity_ratio=ambiguity,
+            reprojection_error_px=error, ambiguity_ratio=ambiguity,
             side_px=side_px, corners_px=corners_px,
         )
 
@@ -337,7 +373,7 @@ class ArucoLandmarkDetector:
         return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
 
-def robot_pose_from_marker(observation: MarkerObservation, marker_map: dict = MARKER_MAP) -> np.ndarray | None:
+def robot_pose_from_marker(observation: MarkerObservation, marker_map: dict[int, np.ndarray]) -> np.ndarray | None:
     """Robot pose [x, y, theta] in the world from one marker sighting.
 
     Frame chain: T_world_base = T_world_marker * inverse(T_base_marker).
@@ -351,7 +387,7 @@ def robot_pose_from_marker(observation: MarkerObservation, marker_map: dict = MA
     return transform_to_pose(T_world_marker @ invert_transform(observation.T_base_marker))
 
 
-def expected_range_bearing(pose, marker_id: int = 0, marker_map: dict = MARKER_MAP) -> np.ndarray:
+def expected_range_bearing(pose, marker_id: int = 0, *, marker_map: dict[int, np.ndarray]) -> np.ndarray:
     """Measurement model h(x): range and bearing expected from pose [x, y, theta].
 
     The h(x) of the Week 2 measurement equation z = h(x) + b + eta.
@@ -360,7 +396,7 @@ def expected_range_bearing(pose, marker_id: int = 0, marker_map: dict = MARKER_M
     return np.array([np.hypot(dx, dy), wrap_angle(np.arctan2(dy, dx) - pose[2])])
 
 
-def range_bearing_jacobian(pose, marker_id: int = 0, marker_map: dict = MARKER_MAP) -> np.ndarray:
+def range_bearing_jacobian(pose, marker_id: int = 0, *, marker_map: dict[int, np.ndarray]) -> np.ndarray:
     """Jacobian H = dh/dx of expected_range_bearing, a 2 x 3 matrix for the EKF."""
     dx, dy = marker_map[marker_id][:2, 3] - np.asarray(pose[:2], dtype=float)
     q = dx * dx + dy * dy
@@ -392,6 +428,7 @@ class Perception:
     """
 
     def __init__(self, model: mujoco.MjModel, noise: bool = False, rng: np.random.Generator | None = None):
+        self.marker_map = marker_map_from_model(model)
         self.camera = RGBCamera(model)
         self.detector = ArucoLandmarkDetector(
             self.camera.camera_matrix, self.camera.dist_coeffs, self.camera.camera_to_base)
@@ -450,28 +487,37 @@ def make_marker_image(path: Path = MARKER_IMAGE) -> Path:
 # score results and to place calibration targets. Nothing above uses it.
 # =============================================================================
 
+# Robot test poses in the station frame: x points out of the dock, yaw pi
+# faces the marker. Transform these with the station so changing its spawn
+# does not leave the accuracy and calibration rigs at the old room location.
 TEST_POSES = [
-    (2.0, 0.0, 0.0),
-    (2.8, 0.0, 0.0),
-    (3.5, 0.0, 0.0),
-    (3.5, 0.4, -0.15),
-    (3.5, -0.4, 0.25),
-    (4.0, 0.0, 0.0),
-    (4.0, 0.3, 0.3),      # marker just outside the 62 deg field of view
-    (4.4, 0.0, 0.0),      # marker partly leaves the top of the image
+    (2.9, 0.0, np.pi),
+    (2.1, 0.0, np.pi),
+    (1.4, 0.0, np.pi),
+    (1.4, -0.4, np.pi - 0.15),
+    (1.4, 0.4, np.pi + 0.25),
+    (0.9, 0.0, np.pi),
+    (0.9, -0.3, np.pi + 0.3),     # marker near/outside the field of view
+    (0.5, 0.0, np.pi),            # elevated panel partly leaves the image
 ]
 
 
-def _load_scene(extra_board: bool = False) -> mujoco.MjModel:
-    from .main import SCENE, load_model
+def _station_test_poses(model, poses):
+    """Move evaluation-only robot rigs with the installed charger."""
+    T_world_station = _fixed_body_transform(model, model.body("charging_station").id)
+    return [transform_to_pose(T_world_station @ pose_to_transform(pose)) for pose in poses]
+
+
+def _load_scene(extra_board: bool = False, config: SceneConfig | None = None) -> mujoco.MjModel:
+    from .main import load_spec
     if not MARKER_IMAGE.exists():
         make_marker_image()
+    spec = load_spec(config=config)
     if not extra_board:
-        return load_model(SCENE)
+        return spec.compile()
     # Calibration scene: the project scene plus a free-floating checkerboard.
     texture = OUTPUT_DIR / "checkerboard.png"
     half_w, half_h = _make_checkerboard(texture)
-    spec = mujoco.MjSpec.from_file(str(SCENE))
     spec.add_texture(name="checkerboard", type=mujoco.mjtTexture.mjTEXTURE_2D, file=str(texture))
     material = spec.add_material(name="checkerboard", specular=0, shininess=0, reflectance=0)
     material.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = "checkerboard"
@@ -526,9 +572,10 @@ def _sim_intrinsics_and_extrinsic(model):
 
 # --- test: marker accuracy, LiDAR frame check --------------------------------------------
 
-def run_marker_test(repeats: int, pixel_noise: float, seed: int) -> None:
+def run_marker_test(repeats: int, pixel_noise: float, seed: int, config: SceneConfig | None = None) -> None:
     rng = np.random.default_rng(seed)
-    model = _load_scene()
+    model = _load_scene(config=config)
+    marker_map = marker_map_from_model(model)
     data = mujoco.MjData(model)
     K, dist, T_base_camera = _sim_intrinsics_and_extrinsic(model)
     detector = ArucoLandmarkDetector(K, dist, T_base_camera)
@@ -541,7 +588,7 @@ def run_marker_test(repeats: int, pixel_noise: float, seed: int) -> None:
           f"{'b bias':>7} {'b sd':>6} {'amb':>5} {'pose err':>8} {'seen':>6}")
     print(f"{'':>20} {'[m]':>7} {'[mm]':>7} {'[mm]':>6} {'[mm]':>7} "
           f"{'[deg]':>7} {'[deg]':>6} {'':>5} {'[mm]':>8} {'':>6}")
-    for pose in TEST_POSES:
+    for pose in _station_test_poses(model, TEST_POSES):
         _place_robot(model, data, pose)
         truth, true_pose = _true_range_bearing(data), _true_pose(data)
         clean = camera.capture(data)
@@ -556,7 +603,7 @@ def run_marker_test(repeats: int, pixel_noise: float, seed: int) -> None:
                 r.append(obs[0].range_m)
                 b.append(obs[0].bearing_rad)
                 amb.append(obs[0].ambiguity_ratio)
-                pose_err.append(np.linalg.norm(robot_pose_from_marker(obs[0])[:2] - true_pose[:2]))
+                pose_err.append(np.linalg.norm(robot_pose_from_marker(obs[0], marker_map)[:2] - true_pose[:2]))
         label = "({:.1f}, {:+.1f}, {:+.2f})".format(*pose)
         if not r:
             print(f"{label:>20} {truth[0]:7.3f} {'not detected':>30}")
@@ -576,30 +623,68 @@ def run_marker_test(repeats: int, pixel_noise: float, seed: int) -> None:
     print(f"Annotated images: {folder}")
 
 
-def run_lidar_test(seed: int) -> None:
+def run_lidar_test(seed: int, config: SceneConfig | None = None) -> None:
     rng = np.random.default_rng(seed)
-    model = _load_scene()
+    model = _load_scene(config=config)
     data = mujoco.MjData(model)
-    _place_robot(model, data, (0.3, 0.6, 0.4))
+    mujoco.mj_forward(model, data)
     points = lidar_points_in_base(add_lidar_noise(read_lidar(data), rng))
     # Evaluation only: put the points on the map with the TRUE pose. If the
     # frame chain is right, they land on the walls and obstacles.
     true_pose = _true_pose(data)
     world = lidar_points_to_world(points, true_pose)
 
-    scale, x0, y0 = 100, -1.3, 2.3
-    canvas = np.full((460, 660, 3), 255, np.uint8)
-    to_px = lambda x, y: (int((x - x0) * scale), int((y0 - y) * scale))
-    station = model.body("charging_station").id
+    # A body is static only when its whole ancestor chain is fixed. This
+    # includes attached furniture and the dock, but excludes robot parts.
+    fixed_bodies = np.ones(model.nbody, dtype=bool)
+    for body in range(1, model.nbody):
+        fixed_bodies[body] = (
+            fixed_bodies[model.body_parentid[body]]
+            and model.body_jntnum[body] == 0
+            and model.body_mocapid[body] == -1
+        )
+    box_corners = {}
+    wall_corners = []
+    corner_signs = np.array([[x, y, z] for x in (-1, 1)
+                             for y in (-1, 1) for z in (-1, 1)])
     for g in range(model.ngeom):
-        if model.geom_bodyid[g] not in (0, station):
+        if not fixed_bodies[model.geom_bodyid[g]] or model.geom_type[g] != mujoco.mjtGeom.mjGEOM_BOX:
             continue
-        p = model.geom_pos[g] + (model.body_pos[station] if model.geom_bodyid[g] == station else 0)
-        size = model.geom_size[g]
+        rotation = data.geom_xmat[g].reshape(3, 3)
+        corners = (corner_signs * model.geom_size[g]) @ rotation.T + data.geom_xpos[g]
+        box_corners[g] = corners
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, g) or ""
+        if name.startswith("wall_"):
+            wall_corners.append(corners)
+    if not wall_corners:
+        raise ValueError("LiDAR map requires fixed wall_* box geometry to determine room bounds")
+    wall_xy = np.concatenate(wall_corners)[:, :2]
+    lower, upper = wall_xy.min(axis=0) - 0.2, wall_xy.max(axis=0) + 0.2
+    scale, x0, y0 = 100, lower[0], upper[1]
+    width, height = np.ceil((upper - lower) * scale).astype(int)
+    canvas = np.full((height, width, 3), 255, np.uint8)
+    to_px = lambda x, y: (int((x - x0) * scale), int((y0 - y) * scale))
+    scan_height = float(data.site("lidar_ray000").xpos[2])
+    for g in range(model.ngeom):
+        if not fixed_bodies[model.geom_bodyid[g]]:
+            continue
+        # Plot collision shapes only. Detailed dock meshes are visual assets.
+        if not (model.geom_contype[g] or model.geom_conaffinity[g]):
+            continue
+        p, rotation, size = data.geom_xpos[g], data.geom_xmat[g].reshape(3, 3), model.geom_size[g]
         if model.geom_type[g] == mujoco.mjtGeom.mjGEOM_BOX:
-            cv2.rectangle(canvas, to_px(p[0] - size[0], p[1] + size[1]), to_px(p[0] + size[0], p[1] - size[1]),
-                          (150, 150, 150), -1)
+            corners = box_corners[g]
+            # The room boxes are upright (possibly yawed). Their XY hull is
+            # the scan slice only if this height intersects the box, leaving
+            # the spaces below table tops and chair seats open on the map.
+            if not corners[:, 2].min() <= scan_height <= corners[:, 2].max():
+                continue
+            pixels = np.array([to_px(x, y) for x, y, _ in corners], np.int32)
+            cv2.fillConvexPoly(canvas, cv2.convexHull(pixels), (150, 150, 150))
         elif model.geom_type[g] == mujoco.mjtGeom.mjGEOM_CYLINDER:
+            half_height = abs(rotation[2, 2]) * size[1] + np.linalg.norm(rotation[2, :2]) * size[0]
+            if not p[2] - half_height <= scan_height <= p[2] + half_height:
+                continue
             cv2.circle(canvas, to_px(p[0], p[1]), int(size[0] * scale), (150, 150, 150), -1)
     for px, py in world:
         cv2.circle(canvas, to_px(px, py), 2, (0, 0, 255), -1)
@@ -610,7 +695,7 @@ def run_lidar_test(seed: int) -> None:
     path = OUTPUT_DIR / "lidar_on_map.png"
     cv2.imwrite(str(path), canvas)
     print(f"\n=== LiDAR frame check ===\n{len(points)} valid points. Drawn on the map "
-          f"(grey obstacles, red scan): {path}")
+          f"(grey obstacles at scan height {scan_height:.3f} m, red scan): {path}")
 
 
 # --- calibrate: intrinsics (checkerboard) and extrinsic check (marker) -------------------
@@ -640,15 +725,16 @@ def _rotation_about(axis, angle) -> np.ndarray:
     return np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * K @ K
 
 
-def calibrate_intrinsics(n_views: int = 25, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
+def calibrate_intrinsics(n_views: int = 25, seed: int = 0,
+                         config: SceneConfig | None = None) -> tuple[np.ndarray, np.ndarray]:
     """Week 3 Parts B and C: checkerboard calibration, scored against the true K."""
     rng = np.random.default_rng(seed)
-    model = _load_scene(extra_board=True)
+    model = _load_scene(extra_board=True, config=config)
     data = mujoco.MjData(model)
     floor = model.geom("floor").id
     model.geom_rgba[floor, 3] = 0.0           # hide the floor so it cannot cut through the board
     model.geom_matid[floor] = -1
-    _place_robot(model, data, (0.0, 0.0, 0.0))
+    mujoco.mj_forward(model, data)
     K_true, _, _ = _sim_intrinsics_and_extrinsic(model)
     camera = _InstantCamera(model)
     mocap = model.body("calibration_board").mocapid[0]
@@ -707,27 +793,34 @@ def calibrate_intrinsics(n_views: int = 25, seed: int = 0) -> tuple[np.ndarray, 
     return K, dist
 
 
-def check_extrinsic(camera_matrix, dist_coeffs) -> np.ndarray:
+def check_extrinsic(camera_matrix, dist_coeffs, config: SceneConfig | None = None) -> np.ndarray:
     """Estimate T_base_camera from marker views at surveyed robot poses and
     compare it with the mounting pose in the robot XML (Week 2 Part C)."""
-    model = _load_scene()
+    model = _load_scene(config=config)
+    marker_map = marker_map_from_model(model)
     data = mujoco.MjData(model)
     _, _, T_xml = _sim_intrinsics_and_extrinsic(model)
     # Identity extrinsic, so T_base_marker below is really T_camera_marker.
     detector = ArucoLandmarkDetector(camera_matrix, dist_coeffs, np.eye(4))
     camera = _InstantCamera(model)
     # Close and oblique, which keeps the planar ambiguity small.
-    rig_poses = [(4.0, 0.25, -0.35), (4.0, -0.25, 0.35), (3.9, 0.1, -0.2), (3.9, -0.1, 0.2),
-                 (4.2, 0.2, -0.45), (4.2, -0.2, 0.45), (3.8, 0.0, 0.0), (4.1, 0.0, 0.15)]
+    rig_poses = _station_test_poses(model, [
+        (0.9, -0.25, np.pi - 0.35), (0.9, 0.25, np.pi + 0.35),
+        (1.0, -0.1, np.pi - 0.2), (1.0, 0.1, np.pi + 0.2),
+        (0.7, -0.2, np.pi - 0.45), (0.7, 0.2, np.pi + 0.45),
+        (1.1, 0.0, np.pi), (0.8, 0.0, np.pi + 0.15),
+    ])
     estimates = []
     for pose in rig_poses:
         _place_robot(model, data, pose)
         obs = [o for o in detector.detect(camera.capture(data)) if o.marker_id == 0]
         if obs:
             T_world_base = make_transform(data.body("base").xmat, data.body("base").xpos)   # rig pose
-            estimates.append(invert_transform(T_world_base) @ MARKER_MAP[0]
+            estimates.append(invert_transform(T_world_base) @ marker_map[0]
                              @ invert_transform(obs[0].T_camera_marker))
     camera.close()
+    if not estimates:
+        raise RuntimeError("No marker views found for the extrinsic check; check charger placement and visibility.")
     t = np.array([T[:3, 3] for T in estimates])
     U, _, Vt = np.linalg.svd(np.mean([T[:3, :3] for T in estimates], axis=0))
     R = U @ np.diag([1, 1, np.linalg.det(U @ Vt)]) @ Vt          # average rotation
@@ -741,14 +834,14 @@ def check_extrinsic(camera_matrix, dist_coeffs) -> np.ndarray:
     return make_transform(R, t.mean(axis=0))
 
 
-def run_sensitivity(seed: int) -> None:
+def run_sensitivity(seed: int, config: SceneConfig | None = None) -> None:
     """How much does an extrinsic error cost? Shift the assumed camera mounting
     and measure the range and bearing error (Week 2 Part C.2 for the camera)."""
-    model = _load_scene()
+    model = _load_scene(config=config)
     data = mujoco.MjData(model)
     K, dist, T_xml = _sim_intrinsics_and_extrinsic(model)
     camera = _InstantCamera(model)
-    poses = [p for p in TEST_POSES if p not in [(4.0, 0.3, 0.3), (4.4, 0.0, 0.0)]]
+    poses = _station_test_poses(model, TEST_POSES[:-2])
     frames = []
     for pose in poses:
         _place_robot(model, data, pose)
@@ -783,6 +876,8 @@ def run_sensitivity(seed: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Perception utilities and self-test.")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG,
+                        help="Scene spawn settings (default: config/scene.toml).")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("make-marker", help="write world/assets/marker_0.png")
     test = sub.add_parser("test", help="marker accuracy and LiDAR frame check (default)")
@@ -793,18 +888,19 @@ def main() -> None:
     sub.add_parser("sensitivity", help="effect of a wrong camera extrinsic")
     args = parser.parse_args()
 
+    config = None if args.command == "make-marker" else load_config(args.config)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     if args.command == "make-marker":
         print(make_marker_image())
     elif args.command == "calibrate":
-        K, dist = calibrate_intrinsics()
-        check_extrinsic(K, dist)
+        K, dist = calibrate_intrinsics(config=config)
+        check_extrinsic(K, dist, config=config)
     elif args.command == "sensitivity":
-        run_sensitivity(seed=0)
+        run_sensitivity(seed=0, config=config)
     else:
         repeats = getattr(args, "repeats", 20)
-        run_marker_test(repeats, getattr(args, "pixel_noise", 2.0), getattr(args, "seed", 0))
-        run_lidar_test(getattr(args, "seed", 0))
+        run_marker_test(repeats, getattr(args, "pixel_noise", 2.0), getattr(args, "seed", 0), config=config)
+        run_lidar_test(getattr(args, "seed", 0), config=config)
 
 
 if __name__ == "__main__":

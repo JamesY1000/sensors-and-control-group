@@ -3,7 +3,7 @@
   <!-- Resolve the robot meshes when this scene is loaded from world/. -->
   <compiler meshdir="../robot_model/turtlebot3_waffle/assets/" texturedir="assets/"/>
 
-  <statistic center="2 0 0.3" extent="4.5"/>
+  <statistic center="3 0 0.3" extent="5.5"/>
 
   <visual>
     <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
@@ -12,58 +12,58 @@
   </visual>
 
   <asset>
+    <!-- Attach keeps the station's mesh and texture paths local to its XML. -->
+    <model name="dock_model" file="charging_station.xml"/>
+    <model name="table_model" file="furniture/table.xml"/>
+    <model name="chair_model" file="furniture/chair.xml"/>
     <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
     <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
       markrgb="0.8 0.8 0.8" width="300" height="300"/>
     <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
-    <!-- ArUco marker (DICT_4X4_50, id 0). Create the image with:
-         python3 -m track_a_mobile_robot.perception make-marker -->
-    <texture name="aruco_0" type="2d" file="marker_0.png"/>
-    <material name="aruco_0" texture="aruco_0" specular="0" shininess="0" reflectance="0"/>
   </asset>
 
   <worldbody>
-    <light pos="2 0 3" dir="0 0 -1" directional="true"/>
+    <attach model="dock_model" body="charging_station" prefix=""/>
+    <light pos="3 0 3" dir="0 0 -1" directional="true"/>
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
 
-    <!-- Interior: 6 m along X (-1 to 5), 4 m along Y (-2 to 2).
-         The robot starts at (0, 0), facing +X. All room geoms are fixed.
+    <!-- Interior: 8 m along X (-1 to 7), 6 m along Y (-3 to 3).
+         The Python launcher applies robot/dock spawns from config/scene.toml.
+         All room geoms are fixed.
          Box size values are HALF the full dimensions, in metres. -->
-    <geom name="wall_west" type="box" pos="-1.05 0 0.4" size="0.05 2 0.4"
+    <geom name="wall_west" type="box" pos="-1.05 0 0.4" size="0.05 3 0.4"
       rgba="0.72 0.75 0.8 1"/>
-    <geom name="wall_east" type="box" pos="5.05 0 0.4" size="0.05 2 0.4"
+    <geom name="wall_east" type="box" pos="7.05 0 0.4" size="0.05 3 0.4"
       rgba="0.72 0.75 0.8 1"/>
-    <geom name="wall_north" type="box" pos="2 2.05 0.4" size="3.1 0.05 0.4"
+    <geom name="wall_north" type="box" pos="3 3.05 0.4" size="4.1 0.05 0.4"
       rgba="0.72 0.75 0.8 1"/>
-    <geom name="wall_south" type="box" pos="2 -2.05 0.4" size="3.1 0.05 0.4"
+    <geom name="wall_south" type="box" pos="3 -3.05 0.4" size="4.1 0.05 0.4"
       rgba="0.72 0.75 0.8 1"/>
 
-    <!-- Low obstacles, all taller than the LiDAR scan plane (~0.126 m).
-         Leave space around both sides of the first box and at the far end
-         of the room for a future charging station. -->
-    <geom name="box_front" type="box" pos="1.5 0 0.15" size="0.25 0.35 0.15"
-      rgba="0.2 0.5 0.8 1"/>
-    <geom name="box_left" type="box" pos="2.8 1.05 0.2" size="0.35 0.25 0.2"
-      rgba="0.9 0.5 0.15 1"/>
-    <!-- Cylinder size is radius and half-height: 0.44 m diameter, 0.35 m tall. -->
-    <geom name="cylinder_right" type="cylinder" pos="3 -0.95 0.175" size="0.22 0.175"
-      rgba="0.2 0.65 0.4 1"/>
+    <!-- Fixed furniture with individual collision legs, not solid bounding boxes.
+         The 0.126 m LiDAR scan sees the legs; tabletops and seats stay above it.
+         Two staggered seating areas leave a clear central approach to the dock.
+         Edit frame positions here to rearrange furniture; dimensions/materials
+         live in furniture/table.xml and furniture/chair.xml. -->
+    <frame name="table_a_placement" pos="2 1.55 0">
+      <attach model="table_model" body="table" prefix="table_a_"/>
+    </frame>
+    <frame name="chair_a_near_placement" pos="2 0.7 0" quat="0.7071067812 0 0 0.7071067812">
+      <attach model="chair_model" body="chair" prefix="chair_a_near_"/>
+    </frame>
+    <frame name="chair_a_far_placement" pos="2 2.4 0" quat="0.7071067812 0 0 -0.7071067812">
+      <attach model="chair_model" body="chair" prefix="chair_a_far_"/>
+    </frame>
 
-    <!-- Charging station against the east wall, facing the robot (-X).
-         Panel 0.28 m square, black marker inside it 0.20 m, centre 0.16 m up. -->
-    <body name="charging_station" pos="4.97 0 0">
-      <geom name="station_back" type="box" pos="0 0 0.17" size="0.03 0.2 0.17"
-        rgba="0.25 0.25 0.28 1"/>
-      <!-- Turned 180 deg about z (in radians: the robot XML sets angle="radian").
-           Without this, MuJoCo draws the texture mirrored on the robot-facing
-           side and the marker cannot be decoded. -->
-      <geom name="station_marker_panel" type="box" pos="-0.035 0 0.16" size="0.005 0.14 0.14"
-        euler="0 0 3.14159265" material="aruco_0" contype="0" conaffinity="0"/>
-      <!-- Marker frame (OpenCV ArUco convention): x right as seen by the robot,
-           y up, z out of the marker towards the robot. Used only to check
-           results against ground truth; hidden from the robot camera. -->
-      <site name="aruco_marker_0" pos="-0.0405 0 0.16" xyaxes="0 -1 0 0 0 1"
-        size="0.01" rgba="1 0 1 1" group="5"/>
-    </body>
+    <frame name="table_b_placement" pos="4.5 -1.55 0">
+      <attach model="table_model" body="table" prefix="table_b_"/>
+    </frame>
+    <frame name="chair_b_near_placement" pos="4.5 -0.7 0" quat="0.7071067812 0 0 -0.7071067812">
+      <attach model="chair_model" body="chair" prefix="chair_b_near_"/>
+    </frame>
+    <frame name="chair_b_far_placement" pos="4.5 -2.4 0" quat="0.7071067812 0 0 0.7071067812">
+      <attach model="chair_model" body="chair" prefix="chair_b_far_"/>
+    </frame>
+
   </worldbody>
 </mujoco>

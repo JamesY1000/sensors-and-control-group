@@ -1,0 +1,29 @@
+<mujoco model="Static dining chair">
+  <compiler angle="radian"/>
+
+  <asset>
+    <material name="chair_upholstery" rgba="0.22 0.42 0.43 1" specular="0.05" shininess="0.05"/>
+    <material name="chair_metal" rgba="0.16 0.18 0.20 1" specular="0.25" shininess="0.2"/>
+  </asset>
+
+  <worldbody>
+    <!-- Ground-centred frame: the chair faces +X, width runs along Y.
+         Overall dimensions: 0.46 m deep x 0.44 m wide x 0.85 m high.
+         The 0.035 m thick seat is centred at z=0.43 m. Each visible
+         primitive collides, leaving open space between the four legs. -->
+    <body name="chair" pos="0 0 0">
+      <geom name="seat" type="box" pos="0 0 0.43"
+        size="0.23 0.22 0.0175" material="chair_upholstery"/>
+      <geom name="back" type="box" pos="-0.2125 0 0.645"
+        size="0.0175 0.22 0.205" material="chair_upholstery"/>
+      <geom name="leg_front_left" type="box" pos="0.175 0.165 0.20625"
+        size="0.02 0.02 0.20625" material="chair_metal"/>
+      <geom name="leg_front_right" type="box" pos="0.175 -0.165 0.20625"
+        size="0.02 0.02 0.20625" material="chair_metal"/>
+      <geom name="leg_back_left" type="box" pos="-0.175 0.165 0.20625"
+        size="0.02 0.02 0.20625" material="chair_metal"/>
+      <geom name="leg_back_right" type="box" pos="-0.175 -0.165 0.20625"
+        size="0.02 0.02 0.20625" material="chair_metal"/>
+    </body>
+  </worldbody>
+</mujoco>
