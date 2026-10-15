@@ -25,12 +25,14 @@ The launcher also prints LiDAR summaries and can save a camera image.
 
 Prediction uses noisy encoders by default. Camera-pose correction is implemented
 in `PoseEKF.correct()`, but camera localisation is not connected yet, so current
-simulation runs remain encoder-only. Navigation and feedback control remain to be added.
+simulation runs remain encoder-only. Navigation and feedback control can be
+tested separately using the true-pose diagnostic below.
 Even ideal encoders can show pose error because the kinematic model approximates
 MuJoCo's physical motion.
 The station is fixed to the world and contains the original Create 3 visual
 mesh, a simple housing collision box, and a supported marker panel above it.
-Docking control and electrical charging behaviour are not implemented.
+The navigation diagnostic targets an approach pose in front of the marker;
+electrical charging is not simulated.
 
 Initial pose standard deviations are **1 cm, 1 cm, 2°**. Additional motion-model
 noise uses **1 cm/√s, 1 cm/√s, 5°/√s**; these are starter assumptions to tune in
@@ -93,6 +95,23 @@ without a display, prefix the capture command with `MUJOCO_GL=egl` if EGL is
 available. Physics-only headless checks need no graphics context. The viewer's
 refresh rate is independent of the Python camera's 30 Hz capture rate.
 Generated images are saved under `outputs/`, which Git ignores.
+
+### Navigation/control diagnostic
+
+The separate diagnostic uses the simulator's true robot pose to test navigation
+and LQI control without EKF drift. It reads the same scene configuration and
+configured landmark map, searches for a marker, and approaches it:
+
+```bash
+python3 -m scripts.run_navigation_true_pose
+MUJOCO_GL=egl python3 -m scripts.run_navigation_true_pose --headless --seconds 2
+```
+
+Use `--config config/my_layout.toml` to select another spawn configuration.
+The navigator assumes an 8 × 6 m room with its long axis along world X; robot
+spawn heading can vary. The short headless command checks startup and control,
+not mission completion. The regular `track_a_mobile_robot.main` launcher keeps
+its manual wheel controls and encoder-only estimator.
 
 ## Configure the starting positions
 
@@ -216,7 +235,9 @@ MUJOCO_GL=egl python3 -m unittest discover -s tests -v
   `StateEstimate` snapshots containing timestamp, world pose and covariance.
 - `track_a_mobile_robot/evaluation.py`: simulator truth and pose-error calculations,
   used only for reporting results.
-- Navigation and control modules are placeholders for later work.
+- `track_a_mobile_robot/navigation.py`: room search and marker approach references.
+- `track_a_mobile_robot/control.py`: LQI feedback and conversion to wheel speeds.
+- `scripts/run_navigation_true_pose.py`: navigation/control diagnostic using true pose.
 
 The future perception connection is `correct(camera_pose_world, camera_covariance,
 time)`: supply the robot's world-frame `(x, y, yaw)` and a positive-definite 3×3
