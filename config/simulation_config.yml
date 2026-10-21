@@ -1,16 +1,24 @@
 # Restart the simulation after editing. Positions are in metres, angles in degrees.
 # World yaw: 0 faces +X, 90 faces +Y, 180 faces -X.
 robot:
-  x: -0.5
+  x: 6.5
   y: -2.5
-  yaw_deg: 0.0
-  # For a near-dock start, use x: 6.0, y: 0.0, yaw_deg: 0.0.
-
-# The dock origin is at floor level; its +X axis points out towards the robot.
-dock:
-  x: 6.9
-  y: 0.0
   yaw_deg: 180.0
+
+dock:
+  x: -0.8
+  y: 2.4
+  yaw_deg: 0
+
+# Some alternative robot/dock starting poses:
+# | Arrangement | Robot starting pose | Dock pose |
+# |---|---|---|
+# | Southwest → northeast | (-0.5, -2.5, 0) | (6.8, 2.4, 180) |
+# | Northwest → southeast | (-0.5, 2.5, 0) | (6.8, -2.4, 180) |
+# | Northeast → southwest | (6.5, 2.5, 180) | (-0.8, -2.4, 0) |
+# | Southeast → northwest | (6.5, -2.5, 180) | (-0.8, 2.4, 0) |
+# | West → east, centred | (-0.5, 0, 0) | (6.8, 0, 180) |
+# | East → west, centred | (6.5, 0, 180) | (-0.8, 0, 0) |
 
 # Camera optical frame in the robot base frame (base: x forward, y left, z up).
 # Optical axes: x right, y down, z forward. These angles give a forward-facing camera.
