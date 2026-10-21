@@ -103,7 +103,7 @@ class PoseEstimator:
             delta_left = encoders.left_encoder_rad - previous_encoders.left_encoder_rad
             delta_right = encoders.right_encoder_rad - previous_encoders.right_encoder_rad
             
-            # Get the Jacobians at previous pose estimate
+            # Get the Jacobians F and G at previous pose estimate
             F, G = self._model.motion_jacobians(self._pose, delta_left, delta_right)
             
             # Predict new robot pose
