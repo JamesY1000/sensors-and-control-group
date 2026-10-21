@@ -98,8 +98,11 @@ def plan_waypoints(start, goal, obstacles, clearance: float, resolution: float) 
         )
     first = tuple(np.rint((start - origin) / resolution).astype(int))
     last = tuple(np.rint((goal - origin) / resolution).astype(int))
-    if blocked[first] or blocked[last]:
+    if first == last:
         return []
+    # Endpoints are the actual positions, not rounded grid centres. Their real
+    # clearance was checked above; validate their connecting edges below too.
+    blocked[first] = blocked[last] = False
     queue = [(math.dist(first, last), first)]
     costs, parents = {first: 0.0}, {}
     visited = set()
@@ -110,7 +113,8 @@ def plan_waypoints(start, goal, obstacles, clearance: float, resolution: float) 
         if cell == last:
             route = [goal.copy()]
             while cell != first:
-                route.append(origin + np.array(cell) * resolution)
+                if cell != last:
+                    route.append(origin + np.array(cell) * resolution)
                 cell = parents[cell]
             route.reverse()
             # Connect as many grid steps as possible with each clear straight segment.
@@ -131,6 +135,11 @@ def plan_waypoints(start, goal, obstacles, clearance: float, resolution: float) 
                 continue
             if blocked[neighbour] or (dx and dy and (blocked[cell[0] + dx, cell[1]] or blocked[cell[0], cell[1] + dy])):
                 continue # Do not cut diagonally between blocked cells
+            if cell == first or neighbour == last:
+                edge_start = start if cell == first else origin + np.array(cell) * resolution
+                edge_end = goal if neighbour == last else origin + np.array(neighbour) * resolution
+                if not segment_is_clear(edge_start, edge_end, obstacles, clearance):
+                    continue
             cost = costs[cell] + math.hypot(dx, dy)
             if cost < costs.get(neighbour, math.inf):
                 costs[neighbour], parents[neighbour] = cost, cell
@@ -290,8 +299,17 @@ class Navigator:
                     self.waypoints = plan_waypoints(pose[:2], self.approach_pose[:2], self._obstacles,
                                                    settings.clearance_m + settings.grid_resolution_m / 2,
                                                    settings.grid_resolution_m)
+                    if not self.waypoints:
+                        # A new scan can put us inside the optional planning margin.
+                        # Try a route with the full configured robot clearance before
+                        # declaring deadlock; every segment must still pass that check.
+                        self.waypoints = plan_waypoints(pose[:2], self.approach_pose[:2], self._obstacles,
+                                                       settings.clearance_m, settings.grid_resolution_m)
                     self._reset_reference()
                 if not self.waypoints or (blocked and not new_scan):
+                    if not segment_is_clear(self.approach_pose[:2], self.approach_pose[:2],
+                                            self._obstacles, settings.clearance_m):
+                        return self._stop(time, pose, "Approach target obstructed; waiting for a clear route")
                     return self._stop(time, pose, "Approach blocked; waiting for a clear route")
                 return self._follow(time, pose, self.waypoints[0], settings.drive_speed_mps, dt)
 

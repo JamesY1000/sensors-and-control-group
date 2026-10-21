@@ -60,6 +60,29 @@ class NavigationTests(unittest.TestCase):
         ring = np.column_stack((np.cos(angles), np.sin(angles)))
         self.assertEqual(plan_waypoints((0, 0), (2, 0), ring, .27, .1), [])
 
+    def test_endpoint_connections_preserve_clearance_near_grid_boundaries(self):
+        obstacles = np.array([(0, .28), (1, 0), (2, .28)])
+        for start, goal in (((0, 0), (2, 0)), ((2, 0), (0, 0))):
+            route = plan_waypoints(start, goal, obstacles, .27, .1)
+            self.assertTrue(route)
+            previous = start
+            for point in route:
+                self.assertTrue(segment_is_clear(previous, point, obstacles, .27))
+                previous = point
+            np.testing.assert_allclose(route[-1], goal)
+
+    def test_optional_planning_margin_does_not_trap_a_safe_start(self):
+        obstacles = np.array([(0, .28), (.7, 0)])
+        pose = (0, 0, 0)
+        reference = self.step(0, pose, obstacles=obstacles)
+        self.assertFalse(reference.stop_requested)
+        previous = pose[:2]
+        for point in self.nav.waypoints:
+            self.assertTrue(segment_is_clear(previous, point, obstacles, self.settings.clearance_m))
+            previous = point
+        # The actual safety clearance still stops the robot.
+        self.assertTrue(self.step(.2, pose, obstacles=[(0, .26)]).stop_requested)
+
     def test_new_scan_replans_a_blocked_segment(self):
         pose = (0, 0, 0)
         self.step(0, pose)
@@ -69,6 +92,11 @@ class NavigationTests(unittest.TestCase):
         self.assertFalse(reference.stop_requested)
         self.assertGreater(len(self.nav.waypoints), 1)
         self.assertTrue(segment_is_clear(pose[:2], self.nav.waypoints[0], wall, .27))
+
+    def test_blocked_approach_target_is_reported(self):
+        reference = self.step(0, (0, 0, 0), obstacles=[self.nav.approach_pose[:2]])
+        self.assertTrue(reference.stop_requested)
+        self.assertIn("Approach target obstructed", self.nav.status)
 
     def test_configured_dock_orientation_sets_targets(self):
         nav = Navigator((3, 4, math.pi / 2), self.settings)

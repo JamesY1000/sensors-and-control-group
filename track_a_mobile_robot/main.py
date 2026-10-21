@@ -22,6 +22,8 @@ It has 3 main stages:
     - Run these together at the configured update rate, with physics stepping between updates
     - Print the estimated world pose, uncertainty and camera correction count
     - Show the live camera feed with marker outlines and correction status in the viewer
+    - Overlay the planned path, current reference and LiDAR hits on the floor
+    - Sync the viewer at 30 Hz and pace the simulation against elapsed wall time
     - Generate a trajectory from the estimated pose and track it with wheel commands
     - Restart estimation if the simulation is reset, and close the camera when finished
 
@@ -31,6 +33,7 @@ Use --navigate to drive autonomously; otherwise the wheels stay stopped for sens
 
 import argparse
 from contextlib import nullcontext
+from dataclasses import replace
 import math
 import os
 from pathlib import Path
@@ -48,7 +51,7 @@ if sys.platform == "linux":
 import mujoco
 import numpy as np
 
-from .display import update_camera_preview
+from .display import NavigationOverlay, update_camera_preview
 from .control import LQIController, velocity_command_to_wheel_speeds
 from .estimation import PoseEstimator, StateEstimate
 from .navigation import Navigator
@@ -59,6 +62,7 @@ from .state_model import DifferentialDriveModel
 
 
 SCENE = Path(__file__).resolve().parents[1] / "world/room_with_charger.xml"
+VIEWER_UPDATE_HZ = 30.0 # Display updates do not need to run at the physics rate
 
 
 def load_spec(path: str | Path = SCENE, config: SceneConfig | None = None) -> mujoco.MjSpec:
@@ -172,6 +176,9 @@ def update_demo(
         estimate = estimator.correct(
             observation.pose_world, observation.covariance, observation.time,
         )
+        if not estimator.camera_correction_accepted:
+            # Rejected EKF measurements must not confirm the dock or count as corrections.
+            output = replace(output, pose_observation=None)
 
     # Without a camera correction, estimate is still the encoder prediction above.
     # Return both outputs for navigation and control to use in the next stage.
@@ -225,17 +232,20 @@ def main() -> None:
         controller = LQIController()
         wheel_ids = [model.actuator(name).id for name in ("wheel_left", "wheel_right")]
         wheel_commands = (0.0, 0.0)
+        overlay = NavigationOverlay() if window is not None else None
         last_physics_time = float(data.time)
         last_update_slot = -1 # Allow the first update at t = 0
         next_report_time = 0.0
         camera_frames = camera_corrections = 0
+        wall_origin = time.perf_counter()
+        sim_origin = float(data.time)
+        next_viewer_sync = wall_origin
         try:
             while window is None or window.is_running():
                 # Sensor scheduling uses simulation time; viewer pacing uses wall-clock time.
                 now = float(data.time)
                 if duration is not None and now >= duration:
                     break
-                step_start = time.perf_counter()
 
                 # Viewer reset starts a new estimate and clears cached sensor samples.
                 if now < last_physics_time:
@@ -244,9 +254,13 @@ def main() -> None:
                     navigator = Navigator(config.dock.pose_world, config.navigation) if args.navigate else None
                     controller.reset()
                     wheel_commands = (0.0, 0.0)
+                    overlay = NavigationOverlay() if window is not None else None
                     last_update_slot = -1
                     next_report_time = 0.0
                     camera_frames = camera_corrections = 0
+                    wall_origin = time.perf_counter()
+                    sim_origin = now
+                    next_viewer_sync = wall_origin
                     print("Simulation reset; estimation, sensor sampling and navigation restarted.", flush=True)
 
                 # At 50 Hz, the slot changes every 0.02 simulated seconds.
@@ -262,6 +276,7 @@ def main() -> None:
                     camera_corrections += int(output.pose_observation is not None)
 
                     # Navigation supplies the reference; control uses only our estimated pose.
+                    reference = None
                     if navigator is not None:
                         reference = navigator.trajectory_reference(estimate, output)
                         command = controller.compute_velocity_command(estimate, reference)
@@ -270,6 +285,7 @@ def main() -> None:
                     # Display the same camera image used by perception, with its detections.
                     if window is not None:
                         update_camera_preview(window, perception, output)
+                        overlay.update(window, estimate, output, navigator, reference)
 
                     # Report once per simulated second, rather than on every estimator update.
                     if now >= next_report_time:
@@ -293,11 +309,15 @@ def main() -> None:
                 last_physics_time = float(data.time)
 
                 if window is not None:
-                    window.sync()
-                    # Pace the viewer approximately in real time; headless runs do not wait.
-                    remaining = model.opt.timestep - (time.perf_counter() - step_start)
+                    # Sync the viewer at 30 Hz of wall time, not every 500 Hz physics step.
+                    if time.perf_counter() >= next_viewer_sync:
+                        window.sync()
+                        next_viewer_sync = time.perf_counter() + 1.0 / VIEWER_UPDATE_HZ
+                    # Pace against elapsed time for the whole run. Expensive sensor updates
+                    # consume this budget; catch up instead of adding another sleep after them.
+                    remaining = wall_origin + (float(data.time) - sim_origin) - time.perf_counter()
                     if remaining > 0:
-                        time.sleep(remaining)
+                        time.sleep(min(remaining, model.opt.timestep))
         except KeyboardInterrupt:
             print("\nSimulation interrupted.", flush=True)
         finally:

@@ -21,9 +21,12 @@ _MIN_DESIGN_SPEED_MPS = 0.05
 # reuses cached Riccati solutions instead of solving one every control step.
 _DESIGN_SPEED_STEP_MPS = 0.01
 _DESIGN_OMEGA_STEP_RAD_S = 0.1
-# The robot never turns tighter than this (|omega| <= |v| / radius), so it
-# never spins on the spot, where the wheels slip and odometry drifts.
+# Limit curvature while translating; alignment uses a separate heading controller.
 _MIN_TURN_RADIUS_M = 0.15
+_HEADING_GAIN = 2.0
+_HEADING_INTEGRAL_GAIN = 1.0
+_HEADING_INTEGRAL_LIMIT = 0.8
+_MAX_ALIGNMENT_RATE_RAD_S = 1.2
 
 # Backwards-compatible name for callers using the previous controller API.
 MotionReference = TrajectoryReference
@@ -43,6 +46,7 @@ class LQIController:
 
     def __init__(self) -> None:
         self._integral_error = np.zeros(2, dtype=float)
+        self._heading_integral = 0.0
         self._previous_error: np.ndarray | None = None
         self._previous_time: float | None = None
         self._previous_command_saturated = False
@@ -51,6 +55,7 @@ class LQIController:
     def reset(self) -> None:
         """Clear accumulated error, for example when a trajectory stops."""
         self._integral_error.fill(0.0)
+        self._heading_integral = 0.0
         self._previous_error = None
         self._previous_time = None
         self._previous_command_saturated = False
@@ -78,6 +83,18 @@ class LQIController:
         )
         if not math.isfinite(elapsed) or elapsed < 0:
             raise ValueError("State estimate time must be finite and non-decreasing.")
+        if reference.rotate_only:
+            # At zero forward speed only heading is controllable. Integral action
+            # overcomes the simulated wheel friction that leaves P-only turns short.
+            candidate = float(np.clip(self._heading_integral + elapsed * error[2],
+                                      -_HEADING_INTEGRAL_LIMIT, _HEADING_INTEGRAL_LIMIT))
+            requested = (reference.omega_ref_rad_s + _HEADING_GAIN * error[2]
+                         + _HEADING_INTEGRAL_GAIN * candidate)
+            omega = float(np.clip(requested, -_MAX_ALIGNMENT_RATE_RAD_S, _MAX_ALIGNMENT_RATE_RAD_S))
+            if abs(requested) <= _MAX_ALIGNMENT_RATE_RAD_S or requested * error[2] < 0:
+                self._heading_integral = candidate
+            self._previous_time = time
+            return VelocityCommand(time=time, v_mps=0.0, omega_rad_s=omega)
         design_period = elapsed if elapsed > 0 else _DEFAULT_CONTROL_PERIOD_S
         gain = _lqi_gain(
             _quantize(reference.v_ref_mps, _DESIGN_SPEED_STEP_MPS),
