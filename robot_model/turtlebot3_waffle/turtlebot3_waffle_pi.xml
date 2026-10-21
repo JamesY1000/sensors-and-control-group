@@ -39,9 +39,13 @@
       <inertial pos="-0.064 0 0.06" mass="1.8" diaginertia="0.01 0.01 0.008"/>
       <joint type="free" name="base_joint"/>
       <geom pos="-0.064 0 0.01" mesh="waffle_pi_base" material="black" class="visual"/>
-      <geom pos="-0.064 0 0.01" mesh="waffle_pi_base" class="collision"/>
-      <geom size="0.005" pos="-0.177 -0.064 0.005" type="sphere" material="grey" friction="0.0001 0.0001 0.0001" solref="0.02 1" solimp="0.95 0.99 0.001" condim="1"/>
-      <geom size="0.005" pos="-0.177 0.064 0.005" type="sphere" material="grey" friction="0.0001 0.0001 0.0001" solref="0.02 1" solimp="0.95 0.99 0.001" condim="1"/>
+      <!-- Lift the chassis collision mesh 2 mm so the rear supports carry the
+           base instead of the mesh dragging on the floor. Keep the visual pose. -->
+      <geom name="chassis_collision" pos="-0.064 0 0.012" mesh="waffle_pi_base" class="collision"/>
+      <!-- Frictionless spheres approximate freely rolling rear supports.
+           Higher priority makes condim=1 override the floor's frictional contact. -->
+      <geom name="rear_support_right" size="0.005" pos="-0.177 -0.064 0.005" type="sphere" material="grey" friction="0.0001 0.0001 0.0001" solref="0.02 1" solimp="0.95 0.99 0.001" condim="1" priority="1"/>
+      <geom name="rear_support_left" size="0.005" pos="-0.177 0.064 0.005" type="sphere" material="grey" friction="0.0001 0.0001 0.0001" solref="0.02 1" solimp="0.95 0.99 0.001" condim="1" priority="1"/>
       <!-- 360 horizontal rays from the LiDAR housing. Angles are radians:
            start forward (+X), then turn counterclockwise in 1-degree steps.
            Sites stay on the base body so the housing does not block its rays. -->
