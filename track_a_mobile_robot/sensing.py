@@ -84,7 +84,7 @@ def read_noisy_wheel_encoders(
 
 @dataclass(frozen=True)
 class LidarReading:
-    """One ideal 2D scan, with angles measured counterclockwise from forward.
+    """One ideal 2D scan, with angles counterclockwise from the LiDAR's +X axis.
 
     time is the scan acquisition time, which can be older than data.time.
     Positive infinity means no return within range; NaN means a hit too close
@@ -159,7 +159,7 @@ class RGBCamera:
         ])
         self.dist_coeffs = np.zeros(5)  # No lens distortion is simulated.
 
-        # Static mounting calibration, not the robot's ground-truth world pose.
+        # Static mounting from the YAML-configured model, not the robot's live pose.
         # OpenCV optical axes: +X right, +Y down, +Z forward.
         if camera.bodyid[0] != model.body("base").id:
             raise ValueError("The RGB camera must be mounted directly on the base body.")

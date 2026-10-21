@@ -1,0 +1,56 @@
+# Restart the simulation after editing. Positions are in metres, angles in degrees.
+# World yaw: 0 faces +X, 90 faces +Y, 180 faces -X.
+robot:
+  x: -0.5
+  y: -2.5
+  yaw_deg: 0.0
+  # For a near-dock start, use x: 6.0, y: 0.0, yaw_deg: 0.0.
+
+# The dock origin is at floor level; its +X axis points out towards the robot.
+dock:
+  x: 6.9
+  y: 0.0
+  yaw_deg: 180.0
+
+# Camera optical frame in the robot base frame (base: x forward, y left, z up).
+# Optical axes: x right, y down, z forward. These angles give a forward-facing camera.
+# Rotation convention: Rz(yaw) @ Ry(pitch) @ Rx(roll).
+camera:
+  position_m: [0.076, 0.0, 0.103]
+  rpy_deg: [-90.0, 0.0, -90.0]
+  fov_y_deg: 48.8
+  # Intrinsics are calculated from this FOV and the image resolution; distortion is zero.
+
+# LiDAR frame in the robot base frame. The 2D scan stays horizontal.
+lidar:
+  position_m: [-0.049, 0.0, 0.1255]
+  yaw_deg: 0.0
+
+# Shared sensing/perception/estimation update rate and repeatable noise seed.
+# Standard deviations are initial tuning assumptions, not calibrated accuracy.
+# Position values apply to both x and y; heading values are in degrees.
+estimation:
+  update_hz: 50.0
+  noise_seed: 42
+  initial_position_std_m: 0.05
+  initial_heading_std_deg: 5.0
+  process_position_std_m_per_sqrt_s: 0.01
+  process_heading_std_deg_per_sqrt_s: 2.0
+
+# Robot-base target distances from the dock origin along its outward-facing +X.
+# Clearance includes the robot footprint and a margin, not just the LiDAR origin.
+navigation:
+  approach_distance_m: 0.5
+  dock_distance_m: 0.30
+  drive_speed_mps: 0.15
+  dock_speed_mps: 0.06
+  turn_speed_rad_s: 0.4
+  acceleration_mps2: 0.25
+  clearance_m: 0.27
+  grid_resolution_m: 0.1
+  position_tolerance_m: 0.03
+  heading_tolerance_deg: 3.0
+  camera_timeout_s: 0.5
+  lidar_timeout_s: 0.5
+  camera_confirmations: 3
+  reference_lead_m: 0.12

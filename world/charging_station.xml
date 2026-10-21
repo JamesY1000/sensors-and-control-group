@@ -18,7 +18,7 @@
   <worldbody>
     <!-- Local +X points out of the dock toward the approaching robot; +Z is up.
          The station origin is at ground height. The default faces world -X.
-         config/scene.toml moves this fixed body, carrying dock and panel together. -->
+         config/simulation_config.yml moves this fixed body, carrying dock and panel together. -->
     <body name="charging_station" pos="6.9 0 0" quat="0 0 0 1">
       <!-- Original iRobot visual geometry, at its original scale (metres).
            Preserve the upstream URDF's 4.6 mm visual origin offset. -->
@@ -51,7 +51,7 @@
         xyaxes="0 1 0 0 0 1" size="0.01" rgba="1 0 1 1" group="5"/>
 
       <!-- Close-range marker remains visible after the large panel leaves the
-           low camera image. The primary ID 0 still defines the docking target.
+           low camera image. Both IDs localise the robot against the configured dock.
            Local +X face is exactly x=-0.025; site and texture share that plane.
            Like the large marker, this thin panel is a visual sensor target. -->
       <geom name="station_near_marker_panel" type="box" pos="-0.026 0 0.12"

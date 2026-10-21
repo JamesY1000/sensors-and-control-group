@@ -1,66 +1,101 @@
-"""Open the default TurtleBot3 scene: python -m track_a_mobile_robot.main."""
+"""
+Our main file should essentially set up the simulation and connect sensing,
+perception, state estimation, navigation and control.
 
-# Set everything up, schedule processing, pass data between components and apply commands to MuJoCo.
+It has 3 main stages:
+
+1. Set up the simulation:
+    - Load the robot/dock starting poses and sensor settings from the YAML config
+    - Apply these settings to the scene and create the MuJoCo model and data
+    - Open the viewer, or run without a window in headless mode
+
+2. Set up the estimation objects:
+    - Create the differential-drive model, pose estimator and perception objects
+    - Initialise the estimated pose from our assumed starting pose in the config
+    - Set the initial covariance, process noise and repeatable sensor noise
+    - Keep these objects between updates so the estimator retains its state
+    - Create navigation and control when autonomous driving is enabled
+
+3. Run the simulation loop:
+    - Read wheel encoders and predict the robot pose and covariance
+    - Process perception and correct using a valid, fresh camera-derived pose
+    - Run these together at the configured update rate, with physics stepping between updates
+    - Print the estimated world pose, uncertainty and camera correction count
+    - Show the live camera feed with marker outlines and correction status in the viewer
+    - Generate a trajectory from the estimated pose and track it with wheel commands
+    - Restart estimation if the simulation is reset, and close the camera when finished
+
+If no valid camera pose is available, the estimate will just be the encoder prediction.
+Use --navigate to drive autonomously; otherwise the wheels stay stopped for sensor checks.
+"""
 
 import argparse
-from contextlib import ExitStack
+from contextlib import nullcontext
 import math
 import os
 from pathlib import Path
 import sys
+import time
 
-# Use XWayland on Linux desktops with DISPLAY available. Native Wayland GLFW
-# failed to initialise window decorations on this development machine.
-# Set PYGLFW_LIBRARY_VARIANT explicitly if another backend is preferred.
+# Use the working XWayland backend on this Linux desktop.
 if sys.platform == "linux" and os.environ.get("DISPLAY"):
     os.environ.setdefault("PYGLFW_LIBRARY_VARIANT", "x11")
+
+# Keep the offscreen camera separate from the viewer's GLFW context on Linux.
+if sys.platform == "linux":
+    os.environ.setdefault("MUJOCO_GL", "egl")
 
 import mujoco
 import numpy as np
 
-from .estimation import PoseEKF, StateEstimate
-from .evaluation import pose_error, read_true_pose
+from .display import update_camera_preview
+from .control import LQIController, velocity_command_to_wheel_speeds
+from .estimation import PoseEstimator, StateEstimate
+from .navigation import Navigator
+from .perception import Perception, PerceptionOutput
 from .scene_config import DEFAULT_CONFIG, SceneConfig, load_config
-from .sensing import (
-    CAMERA_FPS,
-    CAMERA_HEIGHT,
-    CAMERA_WIDTH,
-    LidarReading,
-    RGBCamera,
-    read_absolute_wheel_encoders,
-    read_lidar,
-    read_noisy_wheel_encoders,
-)
+from .sensing import read_noisy_wheel_encoders
 from .state_model import DifferentialDriveModel
 
 
 SCENE = Path(__file__).resolve().parents[1] / "world/room_with_charger.xml"
-# Chosen encoder sampling rate for pose prediction.
-ENCODER_HZ = 50
-# Starting assumptions, not calibrated values: [x metres, y metres, yaw radians].
-INITIAL_POSE_STD = (0.01, 0.01, math.radians(2.0))
-# Motion-model uncertainty growth [m/sqrt(s), m/sqrt(s), rad/sqrt(s)].
-PROCESS_NOISE_STD_PER_SQRT_S = (0.01, 0.01, math.radians(5.0))
 
 
 def load_spec(path: str | Path = SCENE, config: SceneConfig | None = None) -> mujoco.MjSpec:
-    """Apply configured starting poses and add the LiDAR sampling clock.
-
-    MuJoCo 3.15 recursively duplicates an unreferenced XML clock during
-    replication. Adding it after parsing avoids that model-loading problem.
-    The rangefinders and their sampling interval remain defined in robot XML.
-    Applying poses before compilation also makes viewer resets restore them.
-    """
+    """Apply scene poses, sensor mounting and the LiDAR clock before compilation."""
     config = load_config() if config is None else config
+    # Load an editable scene so we can apply the config before compiling it.
     spec = mujoco.MjSpec.from_file(str(path))
-    for name, pose in (("base", config.robot), ("charging_station", config.charger)):
+
+    # Set the robot and dock world poses, keeping their existing ground heights.
+    for name, pose in (("base", config.robot), ("charging_station", config.dock)):
         body = spec.body(name)
         if body is None:
             raise ValueError(f"Scene is missing body {name!r}")
-        # Preserve the model's ground height; only planar placement is configurable.
         body.pos = [pose.x, pose.y, body.pos[2]]
         body.quat = pose.quaternion
+        # Use our quaternion instead of any alternative orientation in the XML.
         body.alt.type = mujoco.mjtOrientation.mjORIENTATION_QUAT
+
+    # Convert the configured OpenCV optical frame into MuJoCo's camera frame.
+    # OpenCV looks along +Z with +Y down; MuJoCo looks along -Z with +Y up.
+    camera = spec.camera("pi_camera_v2")
+    camera.pos = config.camera.position_m
+    rotation = config.camera.rotation @ np.diag([1.0, -1.0, -1.0])
+    quaternion = np.empty(4)
+    mujoco.mju_mat2Quat(quaternion, rotation.ravel())
+    camera.quat = quaternion
+    camera.alt.type = mujoco.mjtOrientation.mjORIENTATION_QUAT
+    camera.fovy = config.camera.fov_y_deg
+
+    # Move the scan rays and LiDAR housing together, keeping the scan horizontal.
+    lidar = spec.frame("lidar_mount")
+    lidar.pos = config.lidar.position_m
+    lidar.quat = config.lidar.quaternion
+    lidar.alt.type = mujoco.mjtOrientation.mjORIENTATION_QUAT
+
+    # Add after XML parsing to avoid duplication by MuJoCo's beam replication.
+    # sensing.read_lidar() uses this clock for the scan acquisition timestamp.
     first_beam = spec.sensor("lidar_range000")
     spec.add_sensor(
         name="lidar_time",
@@ -72,224 +107,205 @@ def load_spec(path: str | Path = SCENE, config: SceneConfig | None = None) -> mu
 
 
 def load_model(path: str | Path = SCENE, config: SceneConfig | None = None) -> mujoco.MjModel:
-    """Compile the scene with the supplied configuration (or config/scene.toml)."""
+    """Compile the configured scene into a simulation model."""
     return load_spec(path, config).compile()
 
 
-def print_lidar(reading: LidarReading) -> None:
-    """Show a compact scan summary instead of printing all 360 distances."""
-    ranges = np.asarray(reading.ranges_m)
-    valid = ranges[np.isfinite(ranges)]
-    nearest = f"{valid.min():.3f} m" if valid.size else "none"
+def create_demo(
+    model: mujoco.MjModel,
+    config: SceneConfig,
+) -> tuple[PoseEstimator, Perception, np.random.Generator]:
+    """Create the estimator, perception and encoder noise generator once per run."""
+    settings = config.estimation
 
-    def distance(index: int) -> str:
-        value = ranges[index]
-        if np.isnan(value):
-            return "too close"
-        if np.isinf(value):
-            return "no return"
-        return f"{value:.3f} m"
-
-    print(
-        f"LiDAR t={reading.time:.3f} s: {valid.size}/{len(ranges)} valid, "
-        f"{np.isnan(ranges).sum()} too close; nearest={nearest}; "
-        f"front={distance(0)}, left={distance(90)}, "
-        f"back={distance(180)}, right={distance(270)}",
-        flush=True,
+    # Starting uncertainty in [x, y, heading]. Convert the heading value to radians.
+    initial_std = np.array([
+        settings.initial_position_std_m,
+        settings.initial_position_std_m,
+        np.deg2rad(settings.initial_heading_std_deg),
+    ])
+    # Additional motion-model uncertainty, expressed per square root of a second.
+    # Squaring these values gives the process covariance added per second.
+    process_std = np.array([
+        settings.process_position_std_m_per_sqrt_s,
+        settings.process_position_std_m_per_sqrt_s,
+        np.deg2rad(settings.process_heading_std_deg_per_sqrt_s),
+    ])
+    # Use the same encoder noise levels that sensing applies to the wheel readings.
+    encoder_std = tuple(
+        float(model.sensor_noise[model.sensor(name).id])
+        for name in ("wheel_left_encoder", "wheel_right_encoder")
     )
 
-
-def print_estimate(estimate: StateEstimate, data: mujoco.MjData) -> None:
-    """Display the estimate and a separate evaluation-only truth comparison."""
-    x, y, yaw = estimate.pose_world
-    true_pose = read_true_pose(data)
-    position_error, heading_error = pose_error(estimate.pose_world, true_pose)
-    std = np.sqrt(np.maximum(np.diag(estimate.covariance), 0.0))
-    print(
-        f"Estimate t={estimate.time:.3f} s: x={x:.4f} m, y={y:.4f} m, "
-        f"yaw={yaw:.4f} rad; std=({std[0]:.4f} m, {std[1]:.4f} m, "
-        f"{std[2]:.4f} rad); evaluation truth="
-        f"({true_pose[0]:.4f}, {true_pose[1]:.4f}, {true_pose[2]:.4f}); "
-        f"position error={position_error:.4f} m, heading error={heading_error:.4f} rad",
-        flush=True,
+    # Square the standard deviations to get the diagonal entries of P0 and Q_rate.
+    estimator = PoseEstimator(
+        model=DifferentialDriveModel(),
+        initial_pose=config.robot.pose_world, # Our assumed starting pose from the config
+        initial_covariance=np.diag(initial_std**2),
+        encoder_noise_std_rad=encoder_std,
+        process_noise_covariance_per_s=np.diag(process_std**2),
     )
+    # Separate streams keep encoder noise independent of camera/LiDAR sampling.
+    encoder_seed, perception_seed = np.random.SeedSequence(settings.noise_seed).spawn(2)
+    encoder_rng = np.random.default_rng(encoder_seed)
+    perception = Perception(model, noise=True, rng=np.random.default_rng(perception_seed))
+    return estimator, perception, encoder_rng
+
+
+def update_demo(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    estimator: PoseEstimator,
+    perception: Perception,
+    encoder_rng: np.random.Generator,
+) -> tuple[StateEstimate, PerceptionOutput]:
+    """Run prediction and any camera correction at one simulation timestamp."""
+    # Predict the current pose and covariance using this update's encoder readings.
+    encoders = read_noisy_wheel_encoders(model, data, encoder_rng)
+    estimate = estimator.predict(encoders)
+
+    # Get LiDAR points, marker detections and any valid new camera-derived robot pose.
+    output = perception.update(data)
+    observation = output.pose_observation
+    # Correct only when perception supplies a fresh pose at this prediction's timestamp.
+    if observation is not None:
+        estimate = estimator.correct(
+            observation.pose_world, observation.covariance, observation.time,
+        )
+
+    # Without a camera correction, estimate is still the encoder prediction above.
+    # Return both outputs for navigation and control to use in the next stage.
+    return estimate, output
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Open the TurtleBot3 world with encoders, LiDAR and an RGB camera.")
+    # Read the run options from the terminal command.
+    parser = argparse.ArgumentParser(description="Run the TurtleBot estimation and docking demo.")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--headless", action="store_true", help="Run without a viewer.")
+    parser.add_argument("--navigate", action="store_true", help="Enable autonomous approach and docking.")
     parser.add_argument(
-        "--config", type=Path, default=DEFAULT_CONFIG,
-        help="Scene starting poses in TOML (default: config/scene.toml in the repository).",
-    )
-    parser.add_argument("--headless", action="store_true", help="Check physics without opening a viewer.")
-    parser.add_argument("--seconds", type=float, default=2.0, help="Duration of a headless check (default: 2 s).")
-    parser.add_argument("--left-wheel", type=float, default=0.0, help="Left wheel velocity target [rad/s].")
-    parser.add_argument("--right-wheel", type=float, default=0.0, help="Right wheel velocity target [rad/s].")
-    parser.add_argument("--seed", type=int, default=42, help="Encoder noise seed (default: 42).")
-    parser.add_argument(
-        "--ideal-encoders", action="store_true",
-        help="Use clean encoder readings for prediction instead of the configured Gaussian noise.",
-    )
-    parser.add_argument(
-        "--camera-output", type=Path,
-        help=f"Sample RGB at {CAMERA_FPS} Hz during a headless run and save its latest frame as a PNG.",
+        "--seconds", type=float,
+        help="Simulation duration; defaults to 2 s headless, or until the viewer closes.",
     )
     args = parser.parse_args()
-    if not math.isfinite(args.seconds) or args.seconds <= 0:
+    if args.seconds is not None and (not math.isfinite(args.seconds) or args.seconds <= 0):
         parser.error("--seconds must be positive and finite")
-    if args.seed < 0:
-        parser.error("--seed must be non-negative")
-    if args.camera_output is not None and not args.headless:
-        parser.error("--camera-output requires --headless")
+    duration = args.seconds
+    # Give headless runs a default duration; viewer runs can continue until closed.
+    if args.headless and duration is None:
+        duration = 2.0
 
-    rng = np.random.default_rng(args.seed)
+    # Load our settings and build the configured simulation model.
     try:
         config = load_config(args.config)
     except ValueError as error:
         parser.error(str(error))
-    model = load_model(SCENE, config)
+    model = load_model(config=config)
+    if config.estimation.update_hz > 1.0 / model.opt.timestep:
+        parser.error("estimation.update_hz cannot exceed the physics update rate")
+    # MjData holds the changing simulation state. Refresh sensors before the first read.
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
-    for name, target in (("wheel_left", args.left_wheel), ("wheel_right", args.right_wheel)):
-        actuator = model.actuator(name)
-        lower, upper = actuator.ctrlrange
-        if not math.isfinite(target) or not lower <= target <= upper:
-            parser.error(f"{name} target must be between {lower:g} and {upper:g} rad/s")
-        data.ctrl[actuator.id] = target
 
-    print(f"Loaded: {SCENE}", flush=True)
-    print(f"Scene config: {args.config.resolve()}", flush=True)
-    for name, pose in (("Robot", config.robot), ("Charger + marker", config.charger)):
-        print(f"{name} start: x={pose.x:g} m, y={pose.y:g} m, yaw={pose.yaw_deg:g} deg", flush=True)
-    print(f"Wheel actuators: {model.nu}; sensor definitions: {model.nsensor}; "
-          f"robot cameras: {model.ncam}", flush=True)
-    print(f"Wheel targets [rad/s]: left={args.left_wheel:g}, right={args.right_wheel:g}", flush=True)
-    print(
-        f"EKF prediction: {ENCODER_HZ} Hz, {'ideal' if args.ideal_encoders else 'noisy'} encoders; "
-        f"noise seed={args.seed}", flush=True,
-    )
-    print("Camera pose correction is available but perception is not connected yet.", flush=True)
-    print(f"Initial ideal encoders: {read_absolute_wheel_encoders(data)}", flush=True)
-
-    drive_model = DifferentialDriveModel()
-    encoder_std = tuple(
-        0.0 if args.ideal_encoders else float(model.sensor_noise[model.sensor(name).id])
-        for name in ("wheel_left_encoder", "wheel_right_encoder")
-    )
-
-    def new_estimator() -> PoseEKF:
-        """Use the same initial pose and uncertainty after a viewer reset."""
-        return PoseEKF(
-            drive_model, config.robot.pose_world, np.diag(np.square(INITIAL_POSE_STD)),
-            encoder_noise_std_rad=encoder_std,
-            process_noise_covariance_per_s=np.diag(np.square(PROCESS_NOISE_STD_PER_SQRT_S)),
-        )
-
-    estimator = new_estimator()
-    last_encoders = None
-    estimate = None
-    last_encoder_slot = -1
-    last_seen_time = -math.inf
-    next_report_time = 0.0
-
-    def sample_estimator(force: bool = False) -> None:
-        """Sample once per encoder period and predict pose plus covariance."""
-        nonlocal estimator, last_encoders, estimate, last_encoder_slot
-        nonlocal last_seen_time, next_report_time
-        now = float(data.time)
-        if now < last_seen_time:
-            # The viewer reset the scene: start a new encoder baseline.
-            estimator = new_estimator()
-            last_encoders = None
-            last_encoder_slot = -1
-            next_report_time = 0.0
-        last_seen_time = now
-        slot = math.floor(now * ENCODER_HZ + 1e-9)
-        if slot == last_encoder_slot:
-            if not force or last_encoders is None or now == last_encoders.time:
-                return
-        if args.ideal_encoders:
-            last_encoders = read_absolute_wheel_encoders(data)
-        else:
-            last_encoders = read_noisy_wheel_encoders(model, data, rng)
-        estimate = estimator.predict(last_encoders)
-        last_encoder_slot = slot
-        if now + 1e-9 >= next_report_time:
-            print_estimate(estimate, data)
-            next_report_time = math.floor(now) + 1.0
-
-    sample_estimator()
-    scan = read_lidar(data)
-    print_lidar(scan)
-
-    if args.headless:
-        steps = math.ceil(args.seconds / model.opt.timestep)
-        last_scan_time = scan.time
-        # A physics-only check still needs no graphics context. Rendering is opt-in.
-        with ExitStack() as stack:
-            camera = stack.enter_context(RGBCamera(model)) if args.camera_output is not None else None
-            frame = camera.read(data) if camera is not None else None
-            frame_count = 1 if frame is not None else 0
-            for _ in range(steps):
-                mujoco.mj_step(model, data)
-                mujoco.mj_forward(model, data)
-                sample_estimator()
-                # The XML clock advances only when a new 5 Hz scan is available.
-                scan_time = float(data.sensor("lidar_time").data[0])
-                if scan_time > last_scan_time:
-                    scan = read_lidar(data)
-                    print_lidar(scan)
-                    last_scan_time = scan.time
-                if camera is not None:
-                    next_frame = camera.read(data)
-                    if next_frame is not frame:
-                        frame_count += 1
-                    frame = next_frame
-            if frame is not None:
-                from PIL import Image
-
-                args.camera_output.parent.mkdir(parents=True, exist_ok=True)
-                Image.fromarray(frame.rgb).save(args.camera_output, format="PNG")
-                print(
-                    f"RGB camera: {CAMERA_WIDTH} x {CAMERA_HEIGHT}, {CAMERA_FPS} Hz, "
-                    f"{frame_count} frames; saved t={frame.time:.3f} s to "
-                    f"{args.camera_output.resolve()}",
-                    flush=True,
-                )
-        if not all(math.isfinite(value) for value in (*data.qpos, *data.qvel)):
-            raise RuntimeError("Simulation produced a non-finite state.")
-        if any(data.warning.number):
-            raise RuntimeError(f"MuJoCo warnings: {data.warning.number}")
-        print(f"Physics check passed: {data.time:.3f} s, no MuJoCo warnings.")
-    else:
+    # Use the same loop in both modes; window will be None when running headless.
+    viewer_context = nullcontext(None)
+    if not args.headless:
         from mujoco import viewer
 
-        if model.opt.integrator == mujoco.mjtIntegrator.mjINT_RK4:
-            raise ValueError("GUI encoder sampling requires a non-RK4 integrator.")
-        # Keep the managed viewer. Its control callback runs after position
-        # sensors refresh, allowing the same sampler to run during GUI stepping.
-        # The time gate prevents new noise samples during pause/repeated forwards.
-        previous_callback = mujoco.get_mjcb_control()
+        viewer_context = viewer.launch_passive(model, data)
 
-        def viewer_update(callback_model, callback_data):
-            if previous_callback is not None:
-                previous_callback(callback_model, callback_data)
-            if callback_model is model and callback_data is data:
-                sample_estimator()
-
+    mode = "autonomous docking" if args.navigate else "stationary sensor demo"
+    print(f"Sensing and EKF: {config.estimation.update_hz:g} Hz; {mode}.", flush=True)
+    print("Pose is in the world frame; sigma is one standard deviation. Camera count is corrections/frames.", flush=True)
+    with viewer_context as window:
+        # Create these once so each update uses the previous estimate and sensor history.
+        estimator, perception, encoder_rng = create_demo(model, config)
+        navigator = Navigator(config.dock.pose_world, config.navigation) if args.navigate else None
+        controller = LQIController()
+        wheel_ids = [model.actuator(name).id for name in ("wheel_left", "wheel_right")]
+        wheel_commands = (0.0, 0.0)
+        last_physics_time = float(data.time)
+        last_update_slot = -1 # Allow the first update at t = 0
+        next_report_time = 0.0
+        camera_frames = camera_corrections = 0
         try:
-            mujoco.set_mjcb_control(viewer_update)
-            viewer.launch(model, data)
-        finally:
-            mujoco.set_mjcb_control(previous_callback)
-        mujoco.mj_forward(model, data)
-        print_lidar(read_lidar(data))
+            while window is None or window.is_running():
+                # Sensor scheduling uses simulation time; viewer pacing uses wall-clock time.
+                now = float(data.time)
+                if duration is not None and now >= duration:
+                    break
+                step_start = time.perf_counter()
 
-    # Include any final partial encoder period so truth and estimate agree in time.
-    sample_estimator(force=True)
-    print_estimate(estimate, data)
-    print(f"Final ideal encoders: {read_absolute_wheel_encoders(data)}")
-    print(f"Final encoders used by estimator: {last_encoders}")
+                # Viewer reset starts a new estimate and clears cached sensor samples.
+                if now < last_physics_time:
+                    perception.close()
+                    estimator, perception, encoder_rng = create_demo(model, config)
+                    navigator = Navigator(config.dock.pose_world, config.navigation) if args.navigate else None
+                    controller.reset()
+                    wheel_commands = (0.0, 0.0)
+                    last_update_slot = -1
+                    next_report_time = 0.0
+                    camera_frames = camera_corrections = 0
+                    print("Simulation reset; estimation, sensor sampling and navigation restarted.", flush=True)
+
+                # At 50 Hz, the slot changes every 0.02 simulated seconds.
+                # Update sensing and estimation once per slot so their timestamps match.
+                # The small tolerance handles floating-point rounding at a slot boundary.
+                update_slot = math.floor(now * config.estimation.update_hz + 1e-9)
+                if update_slot != last_update_slot:
+                    # Refresh sensors at the current state before reading encoders and the camera.
+                    mujoco.mj_forward(model, data)
+                    estimate, output = update_demo(model, data, estimator, perception, encoder_rng)
+                    last_update_slot = update_slot
+                    camera_frames += int(output.new_camera_frame)
+                    camera_corrections += int(output.pose_observation is not None)
+
+                    # Navigation supplies the reference; control uses only our estimated pose.
+                    if navigator is not None:
+                        reference = navigator.trajectory_reference(estimate, output)
+                        command = controller.compute_velocity_command(estimate, reference)
+                        wheel_commands = velocity_command_to_wheel_speeds(command)
+
+                    # Display the same camera image used by perception, with its detections.
+                    if window is not None:
+                        update_camera_preview(window, perception, output)
+
+                    # Report once per simulated second, rather than on every estimator update.
+                    if now >= next_report_time:
+                        x, y, heading = estimate.pose_world
+                        # The diagonal of P contains variances; square roots give standard deviations.
+                        sigma = np.sqrt(np.diag(estimate.covariance))
+                        print(
+                            f"t={now:6.2f}s  pose=({x:+.3f} m, {y:+.3f} m, {np.degrees(heading):+.2f} deg)  "
+                            f"sigma=({sigma[0]:.3f} m, {sigma[1]:.3f} m, {np.degrees(sigma[2]):.2f} deg)  "
+                            f"camera={camera_corrections}/{camera_frames}"
+                            + (f"  {navigator.phase}: {navigator.status}" if navigator else ""),
+                            flush=True,
+                        )
+                        next_report_time = now + 1.0
+
+                # Hold the latest command between updates, then advance physics one timestep.
+                data.ctrl[:] = 0.0
+                data.ctrl[wheel_ids] = wheel_commands
+                mujoco.mj_step(model, data)
+                # Save the post-step time so a reset during viewer sync is detected next loop.
+                last_physics_time = float(data.time)
+
+                if window is not None:
+                    window.sync()
+                    # Pace the viewer approximately in real time; headless runs do not wait.
+                    remaining = model.opt.timestep - (time.perf_counter() - step_start)
+                    if remaining > 0:
+                        time.sleep(remaining)
+        except KeyboardInterrupt:
+            print("\nSimulation interrupted.", flush=True)
+        finally:
+            # Stop wheel commands and release the renderer even if the run is interrupted.
+            data.ctrl[:] = 0.0
+            perception.close()
+
+    print(f"Simulation stopped at t={data.time:.3f}s; camera corrections={camera_corrections}/{camera_frames} frames.")
 
 
 if __name__ == "__main__":
