@@ -9,6 +9,10 @@
     <!-- DICT_4X4_50, ID 0: 0.20 m black marker, 0.04 m white margin per side. -->
     <texture name="aruco_0" type="2d" file="marker_0.png"/>
     <material name="aruco_0" texture="aruco_0" specular="0" shininess="0" reflectance="0"/>
+    <!-- ID 1: 0.04 m black square in a 0.06 m panel, 0.01 m margins.
+         Texture is 400 black pixels inside 600 total pixels: exact 2/3 ratio. -->
+    <texture name="aruco_1" type="2d" file="marker_1.png"/>
+    <material name="aruco_1" texture="aruco_1" specular="0" shininess="0" reflectance="0"/>
   </asset>
 
   <worldbody>
@@ -45,6 +49,16 @@
            This ground-truth site is hidden from the robot camera. -->
       <site name="aruco_marker_0" pos="-0.05 0 0.26"
         xyaxes="0 1 0 0 0 1" size="0.01" rgba="1 0 1 1" group="5"/>
+
+      <!-- Close-range marker remains visible after the large panel leaves the
+           low camera image. The primary ID 0 still defines the docking target.
+           Local +X face is exactly x=-0.025; site and texture share that plane.
+           Like the large marker, this thin panel is a visual sensor target. -->
+      <geom name="station_near_marker_panel" type="box" pos="-0.026 0 0.12"
+        size="0.001 0.03 0.03" material="aruco_1"
+        contype="0" conaffinity="0" density="0" group="2"/>
+      <site name="aruco_marker_1" pos="-0.025 0 0.12"
+        xyaxes="0 1 0 0 0 1" size="0.003" rgba="0 1 1 1" group="5"/>
     </body>
   </worldbody>
 </mujoco>
