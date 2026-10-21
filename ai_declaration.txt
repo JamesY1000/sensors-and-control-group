@@ -5,7 +5,10 @@ James Y:
 - Helped with adding sensor configs to turtlebot3 xml and reading the sensor data
 - Assist with linux display configuration using wayland x11
 - Create a simple generation script to create an aruco marker for the sim environment
-
+- Helped write most unit and integration tests that were then reviewed by me
+- Helped with the main mujoco simulation routine syntax and accessing/rendering the sensors
+- Added a display window inside Mujoco GUI for the simulated camera, marker detections, generated trajectory and detected obstacles
+- Identified that the chassis collision in the urdf was scraping the floor, causing massive heading errors in odometry
 
 Nikhil K:
 
