@@ -12,6 +12,7 @@ It has 2 stages:
     - Propagate the covariance to account for encoder and motion-model uncertainty
 - Correction:
     - Correct the predicted robot pose and covariance using valid and fresh robot pose derived from detected aruco markers (using the RGB camera)
+    - Reject camera innovations inconsistent with prediction and measurement uncertainty
     
 The correction stage will only occur if there are valid and fresh aruco marker derived robot poses, otherwise the output estimated 
 robot pose will just be the predicted pose using wheel encoders.
@@ -27,6 +28,10 @@ import numpy as np
 
 from .sensing import WheelEncoderReading
 from .state_model import DifferentialDriveModel, wrap_angle
+
+
+# 99% chi-squared threshold for a three-component pose innovation.
+CAMERA_INNOVATION_LIMIT = 11.345
 
 
 @dataclass(frozen=True)
@@ -75,6 +80,7 @@ class PoseEstimator:
         
         # Same for camera timestamp
         self._last_camera_time: float | None = None
+        self.camera_correction_accepted = False
     
         
         
@@ -89,6 +95,7 @@ class PoseEstimator:
         """
         
         # Set the previous encoder reading
+        self.camera_correction_accepted = False
         previous_encoders = self._previous_encoders
         
         if previous_encoders is not None:
@@ -165,6 +172,8 @@ class PoseEstimator:
         # Check that the received pose and covariance are the correct shape
         if z.shape != (3,) or R.shape != (3, 3):
             raise ValueError("Expected a 3-element pose and a 3x3 pose covariance")
+        if not np.isfinite(z).all() or not np.isfinite(R).all():
+            raise ValueError("Camera pose and covariance must be finite")
         
         # Compute pose innovation (measured - predicted pose)
         innovation = z - self._pose
@@ -172,6 +181,13 @@ class PoseEstimator:
         
         # Innovation covariance and Kalman Gain
         S = self._P + R
+        # Compare the discrepancy with combined prediction/measurement uncertainty.
+        # Consume rejected frames too; navigation must not count them as confirmations.
+        self._last_camera_time = time
+        self.camera_correction_accepted = False
+        innovation_distance = float(innovation @ np.linalg.solve(S, innovation))
+        if innovation_distance > CAMERA_INNOVATION_LIMIT:
+            return StateEstimate(time, tuple(float(value) for value in self._pose), self._P)
         K = np.linalg.solve(S.T, self._P.T).T
         
         # Correct the estimated pose
@@ -187,8 +203,8 @@ class PoseEstimator:
         # Remove small floating-point asymmetry.
         self._P = 0.5 * (self._P + self._P.T)
         
-        # Update previous camera timestamp with current one
-        self._last_camera_time = time
+        # Tell the caller this measurement was accepted, so navigation can use it.
+        self.camera_correction_accepted = True
         
         pose_world=tuple(float(value) for value in self._pose)
         
@@ -197,4 +213,3 @@ class PoseEstimator:
             pose_world=pose_world,
             covariance=self._P
         )
-        

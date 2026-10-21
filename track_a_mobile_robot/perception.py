@@ -45,6 +45,11 @@ MIN_MARKER_SIDE_PX = 20.0
 MAX_REPROJECTION_ERROR_PX = 2.0
 AMBIGUITY_WARNING = 0.5
 
+# Our planar model places the base origin on the floor, with its Z axis upright.
+# Reject 3D marker solutions inconsistent with that model before discarding Z/tilt.
+MAX_BASE_HEIGHT_ERROR_M = 0.05
+MAX_BASE_TILT_RAD = np.deg2rad(10.0)
+
 # Initial noise assumptions for the demo; tune these using measured errors.
 LIDAR_RANGE_NOISE_STD_M = 0.01
 LIDAR_DROPOUT_PROBABILITY = 0.0
@@ -377,9 +382,17 @@ def select_pose_observation(
     for marker in candidates:
         if not marker.orientation_reliable:
             continue
-        pose = robot_pose_from_marker(marker, marker_map)
-        if pose is None or not np.isfinite(pose).all():
+        T_world_marker = marker_map.get(marker.marker_id)
+        if T_world_marker is None:
             continue
+        T_world_base = T_world_marker @ invert_transform(marker.T_base_marker)
+        if not np.isfinite(T_world_base).all():
+            continue
+        height = T_world_base[2, 3]
+        tilt = np.arccos(np.clip(T_world_base[2, 2], -1.0, 1.0))
+        if abs(height) > MAX_BASE_HEIGHT_ERROR_M or tilt > MAX_BASE_TILT_RAD:
+            continue
+        pose = transform_to_pose(T_world_base)
 
         # Starting covariance model, not a calibrated accuracy claim.
         # Small image footprints and long ranges increase measurement uncertainty.
