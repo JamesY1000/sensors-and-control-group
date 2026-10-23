@@ -1,339 +1,669 @@
 """
-Our navigator should guide the estimated robot pose towards the known charging dock.
+Our navigator should essentially choose between exploring, approaching and docking.
+
+Currently its inputs are:
+- Estimated robot and dock poses (from estimation)
+- Robot-frame LiDAR points and scan timestamps (from perception)
+- Docking offsets, speeds, clearance and LiDAR timeout settings
 
 It has 3 main stages:
-1. Approach: plan waypoints around LiDAR obstacles to the dock approach pose
-2. Align: face the dock and wait for reliable camera pose observations
-3. Dock: follow a slow straight approach, then stop within pose tolerances
+1. Explore:
+   - Send a timed turning command while looking for a marker
+   - When forward clearance is available, drive briefly and scan again
+   - The first usable marker starts odometry and immediately starts the approach
+2. Approach:
+   - Track a full direct trajectory to the coarse dock region using LQI
+   - No final heading is required before handing over using the estimated dock
+   - Follow the sensed obstacle boundary when the direct approach is obstructed
+3. Dock:
+   - PBVS first reaches and aligns at the approach pose
+   - Then PBVS moves to the final offset until position and heading are in tolerance
 
-Navigation generates desired poses and velocities over time. Control uses the
-estimated state to track these references and calculate wheel commands.
-The dock pose is a configured map value; no live simulator pose is used here.
+It outputs:
+- A MotionRequest containing the behaviour, reference pose/velocity and speed limit
+- Current phase and status for the display
+
+Coarse trajectories use local estimated poses; PBVS uses the relative dock estimate.
+There are no grids or global route searches. Boundary following keeps one
+passing side until the corridor clears, with a timeout if it cannot progress.
+LiDAR also checks the actual command; final docking stops when obstructed.
 """
 
 from dataclasses import dataclass
-import heapq
 import math
 
 import numpy as np
 
 from .estimation import StateEstimate
-from .perception import PerceptionOutput, lidar_points_to_world
+from .perception import PerceptionOutput
 from .scene_config import NavigationConfig
 from .state_model import wrap_angle
 
 
 @dataclass(frozen=True)
 class TrajectoryReference:
-    """Desired world pose and velocities at one timestamp, passed to control."""
+    """Store a sample of a turning or curved-driving trajectory in local odometry."""
 
     time: float
-    pose_world: tuple[float, float, float]
-    v_ref_mps: float
-    omega_ref_rad_s: float
-    stop_requested: bool = False
-    segment_id: int = 0 # A new segment resets the controller's integral error
-    rotate_only: bool = False
+    pose_local: tuple[float, float, float]
+    v_mps: float
+    omega_rad_s: float
+    kind: str
+    segment_id: int
+    direction: int = 1
+
+    def __post_init__(self):
+        if self.kind not in ('TURN', 'DRIVE'):
+            raise ValueError('Unknown trajectory segment')
+        if self.direction not in (-1, 1):
+            raise ValueError('Trajectory direction must be -1 or 1')
+        if len(self.pose_local) != 3 or not all(math.isfinite(value) for value in
+                (self.time, *self.pose_local, self.v_mps, self.omega_rad_s)):
+            raise ValueError('Reference pose, time and velocities must be finite')
+
+
+class MotionTrajectory:
+    """Generate direct turn/drive references or short arcs for obstacle detours."""
+
+    def __init__(self, settings):
+        self.settings = settings
+        self._segment_id = 0
+        self.reset()
+
+    def reset(self):
+        self._goal = None
+        self._kind = None
+        self._reference = None
+        self._progress = 0.
+
+    @property
+    def preview(self):
+        """Copy the active segment's start, end and current reference for display."""
+        if self._reference is None:
+            return None
+        return np.vstack((self._start_pose, self._start_pose + self._delta,
+                          self._reference.pose_local))
+
+    def path(self, remaining=False):
+        """Return line endpoints or sample arcs at about 2.5 cm for checking/display."""
+        if self._reference is None:
+            return None
+        # A straight line needs only its endpoints: the collision check covers
+        # every point along each chord, so longer approaches add no sample cost.
+        count = (2 if abs(self._curvature) < 1e-8 else
+                 max(2, math.ceil(abs(self._signed_distance)/.025) + 1))
+        progress = np.linspace(self._progress if remaining else 0., 1., count)
+        return np.array([self._pose_at(value) for value in progress])
+
+    def _pose_at(self, progress):
+        pose = self._start_pose.copy()
+        pose[2] += progress*self._delta[2]
+        if self._kind == 'DRIVE':
+            if abs(self._curvature) < 1e-8:
+                pose[:2] += progress*self._signed_distance*np.array([np.cos(pose[2]), np.sin(pose[2])])
+            else:
+                # Integrate the constant-curvature differential-drive arc exactly.
+                start_heading = self._start_pose[2]
+                pose[:2] += self._direction/self._curvature*np.array([
+                    np.sin(pose[2])-np.sin(start_heading),
+                    np.cos(start_heading)-np.cos(pose[2])])
+        pose[2] = wrap_angle(pose[2])
+        return pose
+
+    def _start(self, time, pose, target, speed, allow_curve=True, max_distance=math.inf):
+        self._segment_id += 1
+        self._start_time = time
+        self._start_pose = np.array(pose, dtype=float)
+        self._goal = np.array(target, dtype=float)
+        delta = target[:2] - pose[:2]
+        distance = float(np.linalg.norm(delta))
+        # Direct travel reaches the full target. Only detours limit the distance.
+        # Keep the endpoint fixed while tracking instead of chasing the robot.
+        if distance > max_distance:
+            delta = delta * max_distance/distance
+            distance = max_distance
+        heading = float(target[2])
+        direction = 1
+        if distance > self.settings.position_tolerance_m:
+            heading = math.atan2(delta[1], delta[0])
+            if (abs(wrap_angle(heading - pose[2])) > math.pi / 2 and
+                    abs(wrap_angle(target[2] - pose[2])) < math.pi / 4):
+                direction = -1
+                heading = wrap_angle(heading + math.pi)
+                speed = min(speed, self.settings.dock_speed_mps)
+        angle = wrap_angle(heading - pose[2])
+        # An arc starts tangent to the current heading. Large bearing changes or
+        # narrow gaps use a spot turn instead of a large sweeping manoeuvre.
+        max_bearing = math.pi/3 if allow_curve else math.radians(self.settings.heading_tolerance_deg)/2
+        self._direction = direction
+        self._curvature = 0.
+        if distance <= self.settings.position_tolerance_m or abs(angle) > max_bearing:
+            self._kind = 'TURN'
+            self._delta = np.array([0., 0., angle])
+            self._signed_distance = 0.
+            self._duration = max(.02, 1.5*abs(angle)/(.8*self.settings.turn_speed_rad_s),
+                                 math.sqrt(6*abs(angle)/.8))
+        else:
+            self._kind = 'DRIVE'
+            if not allow_curve:
+                # The turn has aligned us within tolerance. Use the exact line
+                # heading; LQI removes any small remaining heading error.
+                self._start_pose[2] = heading
+                angle = 0.
+            # A circle through the target, tangent at the start, turns by twice
+            # the target bearing. Arrival heading is free during coarse travel.
+            sweep = 2*angle
+            length = distance if abs(angle) < 1e-8 else distance*angle/math.sin(angle)
+            self._curvature = sweep/length
+            self._signed_distance = direction*length
+            self._delta = np.array([*delta, sweep])
+            # Cubic progress s=3u²-2u³ starts/stops smoothly. Bound both linear
+            # and angular speed/acceleration, reserving 20% for tracking feedback.
+            self._duration = max(.02, 1.5*length/(.8*speed), math.sqrt(6*length/.15),
+                                 1.5*abs(sweep)/(.8*self.settings.turn_speed_rad_s),
+                                 math.sqrt(6*abs(sweep)/.8))
+
+    def sample(self, time, pose, target, speed, *, allow_curve=True, max_distance=math.inf):
+        pose, target = np.asarray(pose, dtype=float), np.asarray(target, dtype=float)
+        restart = self._goal is None
+        if not restart:
+            # Camera corrections can move the local target. Small changes are
+            # absorbed at the next segment; larger changes restart from the estimate.
+            restart = (np.linalg.norm(target[:2] - self._goal[:2]) > .05 or
+                       abs(wrap_angle(target[2] - self._goal[2])) > math.radians(5))
+            if self._reference is not None:
+                reference = np.asarray(self._reference.pose_local)
+                restart |= (np.linalg.norm(pose[:2] - reference[:2]) > .15 or
+                            abs(wrap_angle(pose[2] - reference[2])) > math.radians(25))
+            if time >= self._start_time + self._duration:
+                # Wait for the tracker to settle before advancing to the next
+                # segment. Integral action can then overcome low-speed friction.
+                end = self._start_pose + self._delta
+                settled = (abs(wrap_angle(pose[2] - end[2])) <= math.radians(self.settings.heading_tolerance_deg) / 2
+                           if self._kind == 'TURN' else
+                           np.linalg.norm(pose[:2] - end[:2]) <= self.settings.position_tolerance_m)
+                restart |= settled
+                # A stationary differential drive cannot remove lateral error.
+                # If the segment ends with lateral error, generate a new segment.
+                if self._kind == 'DRIVE':
+                    c, s = math.cos(end[2]), math.sin(end[2])
+                    along, across = np.array([[c, s], [-s, c]]) @ (pose[:2] - end[:2])
+                    restart |= abs(along) <= self.settings.position_tolerance_m and abs(across) > self.settings.position_tolerance_m
+        if restart:
+            self._start(time, pose, target, speed, allow_curve, max_distance)
+        u = float(np.clip((time - self._start_time) / self._duration, 0, 1))
+        progress = 3 * u**2 - 2 * u**3
+        rate = 6 * u * (1 - u) / self._duration
+        self._progress = progress
+        reference = self._pose_at(progress)
+        self._reference = TrajectoryReference(time, tuple(reference), self._signed_distance * rate,
+                                              self._delta[2] * rate, self._kind, self._segment_id, self._direction)
+        return self._reference
+
+
+@dataclass(frozen=True)
+class MotionRequest:
+    """Supply a timed exploration command, an LQI reference or a PBVS dock offset."""
+
+    time: float
+    mode: str
+    speed_limit_mps: float = 0.0
+    dock_offset_m: float | None = None
+    reference: TrajectoryReference | None = None
+    turn_rate_rad_s: float = 0.0
+
+    @property
+    def visual_servo(self) -> bool:
+        return self.mode in ('ALIGN', 'DOCK')
+
+    @property
+    def stop_requested(self) -> bool:
+        return self.mode == 'STOP'
 
     def __post_init__(self) -> None:
-        pose = np.asarray(self.pose_world, dtype=float)
-        if pose.shape != (3,) or not np.all(np.isfinite(pose)):
-            raise ValueError("Reference pose must contain three finite values")
-        if not all(math.isfinite(value) for value in (self.time, self.v_ref_mps, self.omega_ref_rad_s)):
-            raise ValueError("Reference time and velocities must be finite")
-        if not isinstance(self.stop_requested, bool) or not isinstance(self.rotate_only, bool):
-            raise TypeError("Reference mode flags must be bools")
-        if self.rotate_only and self.v_ref_mps != 0:
-            raise ValueError("Rotation references must have zero forward speed")
-        object.__setattr__(self, "pose_world", tuple(float(value) for value in pose))
+        if self.mode not in ('STOP', 'SCAN', 'EXPLORE', 'APPROACH', 'AVOID', 'ALIGN', 'DOCK'):
+            raise ValueError('Unknown motion mode')
+        if not all(math.isfinite(v) for v in (self.time, self.speed_limit_mps, self.turn_rate_rad_s)):
+            raise ValueError('Motion request values must be finite')
+        if self.speed_limit_mps < 0:
+            raise ValueError('Speed limit cannot be negative')
+        if self.mode in ('APPROACH', 'ALIGN', 'DOCK') and (self.dock_offset_m is None or
+                                  not math.isfinite(self.dock_offset_m) or self.dock_offset_m <= 0):
+            raise ValueError('Visual docking requires a positive dock offset')
 
 
-def segment_is_clear(start, end, obstacles: np.ndarray, clearance: float) -> bool:
-    """Check the robot's clearance along a line, including both endpoints."""
-    if not len(obstacles):
-        return True
-    start, end = np.asarray(start), np.asarray(end)
-    direction = end - start
-    length_squared = float(direction @ direction)
-    fractions = np.clip((obstacles - start) @ direction / max(length_squared, 1e-12), 0, 1)
-    closest = start + fractions[:, None] * direction
-    return bool(np.all(np.linalg.norm(obstacles - closest, axis=1) >= clearance))
+def dock_target_pose(dock_pose, offset: float) -> np.ndarray:
+    """Return the offset target in the same frame as the supplied dock pose.
 
-
-def plan_waypoints(start, goal, obstacles, clearance: float, resolution: float) -> list[np.ndarray]:
-    """Find a route through the latest observed points, then remove unnecessary bends.
-
-    A* searches a grid with obstacles expanded by robot clearance. Unknown space
-    is provisionally traversable; incoming scans must recheck the route as we move.
-    An empty route means blocked, not permission to drive straight through.
+    Phase checks use the robot frame; trajectory generation uses local odometry.
     """
-    start, goal = np.asarray(start, dtype=float), np.asarray(goal, dtype=float)
-    obstacles = np.asarray(obstacles, dtype=float).reshape(-1, 2)
-    if start.shape != (2,) or goal.shape != (2,):
-        raise ValueError("Planner start and goal must be XY positions")
-    if not np.all(np.isfinite(np.concatenate((start, goal, obstacles.ravel())))):
-        raise ValueError("Planner positions must be finite")
-    if not all(math.isfinite(value) and value > 0 for value in (clearance, resolution)):
-        raise ValueError("Planner clearance and resolution must be positive")
-    if segment_is_clear(start, goal, obstacles, clearance):
-        return [goal.copy()]
-    if not all(segment_is_clear(p, p, obstacles, clearance) for p in (start, goal)):
-        return []
+    x, y, yaw = dock_pose
+    # Dock +X points out from its face. Place the target along that axis and
+    # reverse its heading by pi so the robot faces into the dock.
+    return np.array([x + offset * math.cos(yaw), y + offset * math.sin(yaw),
+                     wrap_angle(yaw + math.pi)])
 
-    # Grid bounds come from the goal and scan, without assuming a particular room.
-    points = np.vstack((start, goal, obstacles))
-    origin = points.min(axis=0) - 2 * clearance
-    shape = np.ceil((points.max(axis=0) + 2 * clearance - origin) / resolution).astype(int) + 1
-    if np.prod(shape) > 100_000:
-        return [] # Keep a bad or distant goal from creating an unbounded search
-    blocked = np.zeros(tuple(shape), dtype=bool)
-    radius = clearance + resolution / math.sqrt(2)
-    for point in obstacles:
-        lower = np.maximum(0, np.floor((point - radius - origin) / resolution).astype(int))
-        upper = np.minimum(shape, np.ceil((point + radius - origin) / resolution).astype(int) + 1)
-        xs = origin[0] + np.arange(lower[0], upper[0]) * resolution
-        ys = origin[1] + np.arange(lower[1], upper[1]) * resolution
-        blocked[lower[0]:upper[0], lower[1]:upper[1]] |= (
-            (xs[:, None] - point[0])**2 + (ys[None, :] - point[1])**2 <= radius**2
-        )
-    first = tuple(np.rint((start - origin) / resolution).astype(int))
-    last = tuple(np.rint((goal - origin) / resolution).astype(int))
-    if first == last:
-        return []
-    # Endpoints are the actual positions, not rounded grid centres. Their real
-    # clearance was checked above; validate their connecting edges below too.
-    blocked[first] = blocked[last] = False
-    queue = [(math.dist(first, last), first)]
-    costs, parents = {first: 0.0}, {}
-    visited = set()
-    while queue:
-        _, cell = heapq.heappop(queue)
-        if cell in visited:
-            continue
-        if cell == last:
-            route = [goal.copy()]
-            while cell != first:
-                if cell != last:
-                    route.append(origin + np.array(cell) * resolution)
-                cell = parents[cell]
-            route.reverse()
-            # Connect as many grid steps as possible with each clear straight segment.
-            waypoints, current = [], start
-            while route:
-                index = next((i for i in range(len(route) - 1, -1, -1)
-                              if segment_is_clear(current, route[i], obstacles, clearance)), None)
-                if index is None:
-                    return []
-                current = route[index]
-                waypoints.append(current)
-                route = route[index + 1:]
-            return waypoints
-        visited.add(cell)
-        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)):
-            neighbour = cell[0] + dx, cell[1] + dy
-            if not (0 <= neighbour[0] < shape[0] and 0 <= neighbour[1] < shape[1]):
-                continue
-            if blocked[neighbour] or (dx and dy and (blocked[cell[0] + dx, cell[1]] or blocked[cell[0], cell[1] + dy])):
-                continue # Do not cut diagonally between blocked cells
-            if cell == first or neighbour == last:
-                edge_start = start if cell == first else origin + np.array(cell) * resolution
-                edge_end = goal if neighbour == last else origin + np.array(neighbour) * resolution
-                if not segment_is_clear(edge_start, edge_end, obstacles, clearance):
-                    continue
-            cost = costs[cell] + math.hypot(dx, dy)
-            if cost < costs.get(neighbour, math.inf):
-                costs[neighbour], parents[neighbour] = cost, cell
-                heapq.heappush(queue, (cost + math.dist(neighbour, last), neighbour))
-    return []
+
+def motion_is_clear(points_base: np.ndarray, v: float, omega: float, clearance: float,
+                    horizon: float = 1.0) -> bool:
+    """Check the swept footprint of the current command, without planning a route."""
+    points = np.asarray(points_base, dtype=float).reshape(-1, 2)
+    if not np.isfinite(points).all():
+        return False
+    if not len(points):
+        return True
+    if abs(omega) < 1e-9 or abs(v) < 1e-9:
+        return corridor_is_clear(points, [v * horizon, 0], clearance)
+    times = np.linspace(0.0, horizon, 21)
+    centres = np.column_stack((v / omega * np.sin(omega * times),
+                               v / omega * (1 - np.cos(omega * times))))
+    # Half a sample's travel covers the spaces between sampled footprint centres.
+    margin = abs(v) * horizon / 40
+    distances = np.linalg.norm(points[:, None, :] - centres[None, :, :], axis=2)
+    return bool(np.all(distances >= clearance + margin))
+
+
+def path_is_clear(points_base, path_base, clearance):
+    """Check the circular footprint along every chord of a sampled curve."""
+    points, path = np.asarray(points_base), np.asarray(path_base)
+    if not np.isfinite(points).all() or not np.isfinite(path).all():
+        return False
+    if not len(points):
+        return True
+    starts, edges = path[:-1], np.diff(path, axis=0)
+    delta = points[:, None, :] - starts
+    fraction = np.clip(np.sum(delta*edges, axis=2) / np.maximum(np.sum(edges**2, axis=1), 1e-12), 0, 1)
+    distance = np.linalg.norm(delta - fraction[:, :, None]*edges, axis=2)
+    # The curve is sampled at <=2.5 cm; 1 cm padding covers chord approximation.
+    return bool(np.all(distance >= clearance + .01))
+
+
+def corridor_is_clear(points, end, radius):
+    """Check a circular robot swept along the segment from the origin to end."""
+    points, end = np.asarray(points).reshape(-1, 2), np.asarray(end)
+    if not np.isfinite(points).all():
+        return False
+    length2 = float(end @ end)
+    fraction = np.clip(points @ end / length2, 0, 1) if length2 > 1e-12 else np.zeros(len(points))
+    offsets = points - fraction[:, None] * end
+    return bool(np.all(np.sum(offsets * offsets, axis=1) >= radius * radius))
+
+
+def grouped_scan(points, join_gap):
+    """Connect nearby neighbouring returns, leaving wider openings unfilled.
+
+    These short sampled edges describe a local obstacle boundary, not a grid.
+    Robot clearance is applied separately, so joining legs does not enlarge walls.
+    """
+    points = np.asarray(points, dtype=float).reshape(-1, 2)
+    if len(points) < 2 or not np.isfinite(points).all():
+        return points
+    points = points[np.argsort(np.arctan2(points[:, 1], points[:, 0]))]
+    delta = np.roll(points, -1, axis=0) - points
+    lengths = np.linalg.norm(delta, axis=1)
+    edges = (lengths > .05) & (lengths <= join_gap)
+    # Never bridge opposite bearings through the robot itself.
+    edges &= np.sum(points * np.roll(points, -1, axis=0), axis=1) > 0
+    additions = [points]
+    for start, vector, length in zip(points[edges], delta[edges], lengths[edges]):
+        fractions = np.arange(1, math.ceil(length / .05)) / math.ceil(length / .05)
+        additions.append(start + fractions[:, None] * vector)
+    return np.vstack(additions)
+
+
+class BoundaryFollower:
+    """Choose short targets along one side of a locally connected scan boundary."""
+
+    def __init__(self, settings):
+        self.settings = settings
+        self.reset()
+
+    def reset(self):
+        self.active = self.failed = False
+        self.reason = ''
+        self.target = self.anchor = None
+        self.side = 0
+        self._clear_since = None
+        self._scan = self._boundary = None
+
+    def exhausted(self, time):
+        return self.failed or (self.active and time - self._started > self.settings.detour_timeout_s)
+
+    def update(self, time, pose, goal, points, range_max, *, forced=False):
+        pose, goal = np.asarray(pose), np.asarray(goal)
+        points = np.asarray(points, dtype=float).reshape(-1, 2)
+        if not np.isfinite(points).all():
+            return 'waiting', None
+        # The scan is slower than control. Reuse its connected edges between scans.
+        if self._scan is None or not np.array_equal(points, self._scan):
+            self._scan = points.copy()
+            self._boundary = grouped_scan(points, self.settings.boundary_join_gap_m)
+        boundary = self._boundary
+        c, s = math.cos(pose[2]), math.sin(pose[2])
+        rotation = np.array([[c, -s], [s, c]])
+        delta = rotation.T @ (goal[:2] - pose[:2])
+        distance = float(np.linalg.norm(delta))
+        direction = delta / max(distance, 1e-9)
+        radius = self.settings.clearance_m + .04  # Includes edge-sampling margin.
+        lookahead = min(distance, max(0., range_max - radius))
+        if not self.active:
+            if not len(boundary):
+                return 'clear', None
+            # Check all observed obstacles along the direct route, including
+            # distant blockers. Unseen space still needs checking on later scans.
+            if corridor_is_clear(boundary, delta, radius) and not forced:
+                return 'clear', None
+            along = np.clip(boundary @ direction, 0., distance)
+            blocking = boundary[np.linalg.norm(boundary-along[:, None]*direction, axis=1) <= radius]
+            contacts = blocking if len(blocking) else boundary
+            contact = contacts[np.argmin(np.linalg.norm(contacts, axis=1))]
+            # Seeing a distant blockage does not mean we are at its boundary.
+            # First track the clear prefix of the direct route, stopping short
+            # by enough room to turn. Re-evaluate this from each new scan.
+            stand_off = max(1., radius + self.settings.detour_step_m)
+            advance = float(contact @ direction) - stand_off
+            if not forced and advance > self.settings.position_tolerance_m:
+                end = direction * advance
+                if corridor_is_clear(boundary, end, radius):
+                    return 'approach', np.array([*(pose[:2] + rotation @ end),
+                        wrap_angle(pose[2] + math.atan2(direction[1], direction[0]))])
+            self.active = True
+            self._started = self._progress_time = time
+            self._hit = self._progress_pose = pose[:2].copy()
+            self._hit_distance = distance
+            self._travel = 0.
+            # Start on the obstacle blocking the goal corridor, not an unrelated
+            # nearer wall beside/behind the robot. Remember that contact locally.
+            self.anchor = pose[:2] + rotation @ contact
+
+        # Leave only after sustained clearance and progress beyond the hit point.
+        # Removing the obstruction entirely also permits a stopped robot to resume.
+        progress = distance < self._hit_distance - .1 or not len(boundary) or self.failed
+        if progress and corridor_is_clear(boundary, direction * lookahead, radius + .04) and not forced:
+            if self._clear_since is None:
+                self._clear_since = time
+            if time - self._clear_since >= .4:
+                self.reset()
+                return 'clear', None
+        else:
+            self._clear_since = None
+        moved = np.linalg.norm(pose[:2] - self._progress_pose)
+        if moved >= .1:
+            self._travel += moved
+            self._progress_pose = pose[:2].copy()
+            self._progress_time = time
+        looped = self._travel > 2. and np.linalg.norm(pose[:2] - self._hit) < .2
+        stalled = time - self._progress_time > self.settings.progress_timeout_s
+        self.failed = self.exhausted(time) or looped or stalled
+        if self.failed:
+            if not self.reason:
+                self.reason = ('Boundary loop detected; stopped' if looped else
+                               'Boundary stalled; no position progress' if stalled else
+                               'Detour time budget exhausted; stopped')
+            self.target = None
+            return 'blocked', None
+
+        # Hold a target until reached or newly obstructed, rather than replacing it
+        # on each noisy scan. Physical clearance still guards every actual command.
+        if self.target is not None:
+            local = rotation.T @ (self.target[:2] - pose[:2])
+            if (self.settings.position_tolerance_m < np.linalg.norm(local) <= self.settings.detour_step_m + .15
+                    and corridor_is_clear(boundary, local, radius - .02) and not forced):
+                return 'avoid', self.target
+            self.target = None
+        if not len(boundary):
+            return 'waiting', None
+
+        # Advance the contact along a local section of the same boundary. Choosing
+        # the globally nearest hit here can switch from furniture to the room wall.
+        anchor_base = rotation.T @ (self.anchor - pose[:2])
+        contact_distances = np.linalg.norm(boundary-anchor_base, axis=1)
+        nearby = boundary[contact_distances <= max(.5, self.settings.detour_step_m + .15)]
+        nearest = (nearby[np.argmin(np.linalg.norm(nearby, axis=1))] if len(nearby)
+                   else boundary[np.argmin(contact_distances)])
+        self.anchor = pose[:2] + rotation @ nearest
+        separation = max(float(np.linalg.norm(nearest)), 1e-9)
+        normal = nearest / separation
+        tangent = np.array([-normal[1], normal[0]])
+        candidates = []
+        for side in ((self.side,) if self.side else (1, -1)):
+            follow = side*tangent + np.clip(2*(separation-radius-.15), -.8, .8)*normal
+            bearing = math.atan2(follow[1], follow[0])
+            for offset in (0, 15, -15, 30, -30, 60, -60, 90, -90):
+                angle = wrap_angle(bearing + math.radians(offset))
+                for step in (self.settings.detour_step_m, self.settings.detour_step_m/2):
+                    end = step * np.array([math.cos(angle), math.sin(angle)])
+                    if corridor_is_clear(boundary, end, radius):
+                        score = abs(offset)/90 + .2*np.linalg.norm(delta-end) - step
+                        candidates.append((score, side, angle, end))
+        if not candidates:
+            return 'waiting', None
+        _, self.side, angle, end = min(candidates, key=lambda item: item[0])
+        self.target = np.array([*(pose[:2] + rotation @ end), wrap_angle(pose[2] + angle)])
+        return 'avoid', self.target
 
 
 class Navigator:
-    """Maintain the docking stage, planned waypoints and current reference."""
+    """Maintain docking phases, generate references and check motion clearance."""
 
-    def __init__(self, dock_pose_world, settings: NavigationConfig) -> None:
+    def __init__(self, settings: NavigationConfig) -> None:
         self.settings = settings
-        x, y, yaw = dock_pose_world
-        if not np.all(np.isfinite((x, y, yaw))):
-            raise ValueError("Dock pose must be finite")
-        outward = np.array([math.cos(yaw), math.sin(yaw)])
-        heading = wrap_angle(yaw + math.pi)
-        self.approach_pose = np.r_[np.array([x, y]) + settings.approach_distance_m * outward, heading]
-        self.docking_pose = np.r_[np.array([x, y]) + settings.dock_distance_m * outward, heading]
-        self.phase = "APPROACH"
-        self.status = "Planning approach"
-        self.waypoints: list[np.ndarray] = []
-        self._obstacles = np.empty((0, 2))
-        self._scan_time = None
-        self._camera_time = None
-        self._last_good_camera_time = -math.inf
-        self._good_frames = 0
+        self.phase = 'SCAN'
+        self.status = 'Scanning for a usable dock marker'
+        self._search_remaining = settings.search_spin_s
+        self._search_active = False
+        self.dock_pose = self.coarse_pose = self.approach_pose = self.docking_pose = None
         self._previous_time = None
-        self._segment_id = 0
-        self._reset_reference()
+        self._trajectory = MotionTrajectory(settings)
+        self._detour = BoundaryFollower(settings)
+        self._motion_blocked = False
+        self._path_scan_time = None
+        self._path_obstacles = np.empty((0, 2))
 
-    def _reset_reference(self) -> None:
-        self._segment_start = None
-        self._segment_goal = None
-        self._heading_reference = None
-        self._progress = 0.0
-        self._speed = 0.0
-        self._turning = True
+    def _explore(self, time, perception):
+        """Alternate timed wheel commands; LiDAR decides whether forward travel is clear."""
+        if self._search_remaining <= 0:
+            if self.phase == 'EXPLORE':
+                self.phase = 'SCAN'
+                self._search_remaining = self.settings.search_spin_s
+            else:
+                # Check the intended short drive before starting it. Keep turning
+                # until a clear opening faces forward; no pose or visited map is used.
+                points = grouped_scan(perception.lidar_points_base, self.settings.boundary_join_gap_m)
+                distance = self.settings.drive_speed_mps * self.settings.search_drive_s
+                if distance + self.settings.clearance_m < perception.lidar.range_max_m and corridor_is_clear(
+                        points, [distance, 0], self.settings.clearance_m + .04):
+                    self.phase = 'EXPLORE'
+                    self._search_remaining = self.settings.search_drive_s
+        self._search_active = True
+        if self.phase == 'SCAN':
+            self.status = 'Timed scan for dock; no odometry yet'
+            return MotionRequest(time, 'SCAN', turn_rate_rad_s=self.settings.turn_speed_rad_s)
+        self.status = 'Short forward exploration command; no odometry yet'
+        return MotionRequest(time, 'EXPLORE', self.settings.drive_speed_mps)
 
-    def _reference(self, time, pose, v=0.0, omega=0.0, *, stop=False, rotate=False):
-        return TrajectoryReference(time, tuple(pose), v, omega, stop, self._segment_id, rotate)
+    @property
+    def detour_pose(self):
+        return self._detour.target
 
-    def _stop(self, time, pose, reason):
+    @property
+    def trajectory_preview(self):
+        return self._trajectory.preview
+
+    @property
+    def trajectory_path(self):
+        return self._trajectory.path()
+
+    def _tracking_request(self, state, offset, speed, perception, target=None):
+        direct = self.phase == 'APPROACH'
+        target = dock_target_pose(state.dock_pose_local, offset) if target is None else target
+        if perception.lidar.time != self._path_scan_time:
+            self._path_scan_time = perception.lidar.time
+            self._path_obstacles = grouped_scan(perception.lidar_points_base, self.settings.boundary_join_gap_m)
+        horizon = (math.inf if direct else
+                   min(1., perception.lidar.range_max_m - self.settings.clearance_m - .1))
+        if horizon <= 0:
+            return self._stop(state.time, 'Insufficient LiDAR range for a trajectory')
+        pose = np.asarray(state.pose_local)
+        c, s = math.cos(pose[2]), math.sin(pose[2])
+        rotation = np.array([[c, -s], [s, c]])
+        # Direct approach turns then follows one full line. Detours may use a
+        # short arc, falling back to a turn if it cannot fit. Check the entire
+        # remaining reference on every update, not just its first metre.
+        for allow_curve in ((False,) if direct else (True, False)):
+            reference = self._trajectory.sample(state.time, pose, target, speed,
+                                                allow_curve=allow_curve, max_distance=horizon)
+            path = np.vstack((pose[:2], self._trajectory.path(remaining=True)[:, :2]))
+            path_base = (path - pose[:2]) @ rotation
+            if path_is_clear(self._path_obstacles, path_base, self.settings.clearance_m):
+                return MotionRequest(state.time, self.phase, speed, offset, reference=reference)
+            self._trajectory.reset()
+        self._motion_blocked = True
+        self._detour.target = None
+        return self._stop(state.time, 'Trajectory blocked by LiDAR; choosing a detour')
+
+    def _stop(self, time, reason):
         self.status = reason
-        self._reset_reference()
-        return self._reference(time, pose, stop=True)
+        self._search_active = False
+        self._trajectory.reset()
+        return MotionRequest(time, 'STOP')
 
-    def _change_phase(self, phase):
-        self.phase = phase
-        self._reset_reference()
-
-    def _rotate(self, time, pose, heading, dt):
-        # Advance a heading reference at the configured turn rate, with zero translation.
-        if self._heading_reference is None:
-            self._heading_reference = pose[2]
-            self._segment_id += 1
-        change = np.clip(wrap_angle(heading - self._heading_reference),
-                         -self.settings.turn_speed_rad_s * dt, self.settings.turn_speed_rad_s * dt)
-        self._heading_reference = wrap_angle(self._heading_reference + change)
-        return self._reference(time, (*pose[:2], self._heading_reference),
-                               omega=float(change / dt) if dt else 0.0, rotate=True)
-
-    def _follow(self, time, pose, goal, speed_limit, dt, start=None):
-        # Each straight segment starts with alignment. We stop at bends for this demo.
-        if self._segment_goal is None or not np.array_equal(goal, self._segment_goal):
-            self._reset_reference()
-            self._segment_start = np.array(pose[:2] if start is None else start, copy=True)
-            self._segment_goal = goal.copy()
-            self._segment_id += 1
-            # Resume the final line at current progress after a camera-loss pause.
-            if start is not None:
-                line = goal - self._segment_start
-                length = float(np.linalg.norm(line))
-                if length > 0:
-                    self._progress = float(np.clip((pose[:2] - start) @ (line / length), 0, length))
-        displacement = goal - self._segment_start
-        length = float(np.linalg.norm(displacement))
-        if length < 1e-9:
-            return self._stop(time, pose, "Segment complete")
-        direction = displacement / length
-        heading = math.atan2(direction[1], direction[0])
-        error = abs(wrap_angle(heading - pose[2]))
-        if self._turning:
-            if error > math.radians(self.settings.heading_tolerance_deg):
-                self.status = "Turning towards next waypoint"
-                return self._rotate(time, pose, heading, dt)
-            self._turning = False
-            self._segment_id += 1
-            dt = 0.0 # Begin forward motion on the following update
-
-        # Accelerate and brake the reference, keeping it close enough for tracking.
-        remaining = max(0.0, length - self._progress)
-        desired_speed = min(speed_limit, math.sqrt(2 * self.settings.acceleration_mps2 * remaining))
-        speed = min(desired_speed, self._speed + self.settings.acceleration_mps2 * dt)
-        along = float((pose[:2] - self._segment_start) @ direction)
-        limit = max(self._progress, min(length, max(0.0, along) + self.settings.reference_lead_m))
-        progress = min(limit, self._progress + 0.5 * (self._speed + speed) * dt)
-        velocity = (progress - self._progress) / dt if dt else 0.0
-        self._progress, self._speed = progress, speed
-        reference_xy = self._segment_start + progress * direction
-        self.status = "Following approach path" if self.phase == "APPROACH" else "Docking slowly"
-        return self._reference(time, (*reference_xy, heading), velocity)
-
-    def trajectory_reference(self, state_estimate: StateEstimate, perception: PerceptionOutput,
-                             *, stop_requested: bool = False) -> TrajectoryReference:
-        """Plan from estimated state and sensor observations, then return one reference."""
-        pose = np.asarray(state_estimate.pose_world, dtype=float)
-        time = float(state_estimate.time)
-        if pose.shape != (3,) or not np.all(np.isfinite(pose)) or not math.isfinite(time):
-            raise ValueError("Estimated pose and time must be finite")
+    def motion_request(self, state: StateEstimate, perception: PerceptionOutput,
+                       *, stop_requested: bool = False) -> MotionRequest:
+        """Choose the next behaviour using estimated poses and fresh observations."""
+        time = float(state.time)
+        if not math.isfinite(time) or not np.isfinite(state.pose_local).all():
+            raise ValueError('Estimated pose and time must be finite')
         if self._previous_time is not None and time <= self._previous_time:
-            raise ValueError("Navigation timestamps must increase; recreate the navigator on reset")
-        dt = 0.0 if self._previous_time is None else time - self._previous_time
+            raise ValueError('Navigation timestamps must increase; recreate navigation on reset')
+        dt = 0. if self._previous_time is None else time - self._previous_time
         self._previous_time = time
-        settings = self.settings
-        tolerance = settings.position_tolerance_m
-        heading_tolerance = math.radians(settings.heading_tolerance_deg)
+        if self._search_active:
+            self._search_remaining -= dt
+        self._search_active = False
+        if stop_requested or self.phase == 'DONE':
+            return self._stop(time, 'Stop requested' if stop_requested else 'Docked')
 
-        # Remember fresh reliable camera observations; cached images are not confirmations.
-        if perception.new_camera_frame and perception.camera.time != self._camera_time:
-            self._camera_time = perception.camera.time
-            observation = perception.pose_observation
-            if observation is not None and 0 <= time - observation.time <= settings.camera_timeout_s:
-                self._last_good_camera_time = observation.time
-                self._good_frames += 1
-            else:
-                self._good_frames = 0
-        camera_recent = time - self._last_good_camera_time <= settings.camera_timeout_s
+        # Acquisition starts approach, even on the very first update.
+        # Both trajectory targets and phase checks come from the joint estimate.
+        if state.dock_pose_local is not None:
+            if self.dock_pose is None:
+                self.phase = 'APPROACH'
+                self._trajectory.reset()
+                self._search_active = False
+            self.dock_pose = np.asarray(state.dock_pose_local)
+            self.coarse_pose = dock_target_pose(self.dock_pose, self.settings.coarse_distance_m)
+            self.approach_pose = dock_target_pose(self.dock_pose, self.settings.approach_distance_m)
+            self.docking_pose = dock_target_pose(self.dock_pose, self.settings.dock_distance_m)
 
-        if stop_requested or self.phase == "DONE":
-            return self._stop(time, pose, "Stop requested" if stop_requested else "Docked")
         scan_age = time - perception.lidar.time
-        if not math.isfinite(scan_age) or not -1e-9 <= scan_age <= settings.lidar_timeout_s:
-            return self._stop(time, pose, "Waiting for fresh LiDAR")
-        if perception.lidar_too_close:
-            return self._stop(time, pose, "Obstacle inside LiDAR minimum range")
-        new_scan = perception.lidar.time != self._scan_time
-        if new_scan:
-            self._obstacles = lidar_points_to_world(perception.lidar_points_base, pose)
-            self._scan_time = perception.lidar.time
-        if not segment_is_clear(pose[:2], pose[:2], self._obstacles, settings.clearance_m):
-            return self._stop(time, pose, "Obstacle inside robot clearance")
+        if not math.isfinite(scan_age) or not -1e-9 <= scan_age <= self.settings.lidar_timeout_s:
+            return self._stop(time, 'Waiting for fresh LiDAR')
+        if perception.lidar_too_close or not motion_is_clear(
+                perception.lidar_points_base, 0, 0, self.settings.clearance_m):
+            return self._stop(time, 'Obstacle inside robot clearance')
+        if state.dock_pose_local is None:
+            return self._explore(time, perception)
+        # Obstacle recovery retains its finite time budget.
+        # Once exhausted, only a newly clear corridor (or reset) releases the stop.
+        if self._detour.exhausted(time):
+            result, _ = self._detour.update(time, state.pose_local, self.coarse_pose,
+                perception.lidar_points_base, perception.lidar.range_max_m)
+            self.phase = 'APPROACH' if result == 'clear' else 'AVOID'
+            if result != 'clear':
+                return self._stop(time, self._detour.reason)
+        # After first acquisition, continue from encoder prediction for as long
+        # as needed. Fresh accepted camera poses correct the EKF when available;
+        # marker loss never starts a stop, reacquisition turn or new local frame.
 
-        if self.phase == "APPROACH":
-            if np.linalg.norm(pose[:2] - self.approach_pose[:2]) <= tolerance:
-                self.waypoints.clear()
-                self._change_phase("ALIGN")
+        dock_base = state.dock_pose_base
+        coarse = dock_target_pose(dock_base, self.settings.coarse_distance_m)
+        approach = dock_target_pose(dock_base, self.settings.approach_distance_m)
+        final = dock_target_pose(dock_base, self.settings.dock_distance_m)
+        # Reach the actual stand-off point along the dock normal before PBVS.
+        # Distance to the dock alone would admit close sideways approaches.
+        # Heading remains free: PBVS handles the precise alignment afterwards.
+        front = -np.dot(dock_base[:2], [math.cos(dock_base[2]), math.sin(dock_base[2])])
+        at_coarse = front > 0 and np.linalg.norm(coarse[:2]) <= self.settings.coarse_tolerance_m
+        if self.phase in ('APPROACH', 'AVOID') and at_coarse and corridor_is_clear(
+                perception.lidar_points_base, approach[:2], self.settings.clearance_m):
+            # The stored joint estimate also supports handover during occlusion.
+            self.phase = 'ALIGN'
+            self._trajectory.reset()
+            self._detour.reset()
+            self._motion_blocked = False
+
+        if self.phase in ('APPROACH', 'AVOID'):
+            # Only after reaching the stand-off region may avoidance aim towards
+            # the PBVS offset. Side arrivals must first reach the coarse target.
+            goal = self.approach_pose if at_coarse else self.coarse_pose
+            result, target = self._detour.update(time, state.pose_local, goal,
+                perception.lidar_points_base, perception.lidar.range_max_m, forced=self._motion_blocked)
+            self._motion_blocked = False
+            if result == 'approach':
+                self.phase = 'APPROACH'
+                self.status = 'LQI: approaching distant obstruction along the clear route'
+                return self._tracking_request(state, self.settings.coarse_distance_m,
+                    self.settings.drive_speed_mps, perception, target)
+            if result != 'clear':
+                self.phase = 'AVOID'
+                if target is None:
+                    reason = (self._detour.reason if result == 'blocked'
+                              else 'Boundary blocked; waiting for clearance')
+                    return self._stop(time, reason)
+                self.status = f'Following boundary {"left" if self._detour.side > 0 else "right"} with LQI'
+                return self._tracking_request(state, None, self.settings.detour_speed_mps, perception, target)
+            if self.phase == 'AVOID':
+                self._trajectory.reset()
+                self.phase = 'APPROACH'
+
+        tolerance = self.settings.position_tolerance_m
+        heading_tolerance = math.radians(self.settings.heading_tolerance_deg)
+        if self.phase == 'ALIGN':
+            if np.linalg.norm(approach[:2]) <= tolerance and abs(approach[2]) <= heading_tolerance:
+                self.phase = 'DOCK'
             else:
-                if self.waypoints and np.linalg.norm(pose[:2] - self.waypoints[0]) <= tolerance:
-                    self.waypoints.pop(0)
-                    self._reset_reference()
-                blocked = bool(self.waypoints) and not segment_is_clear(
-                    pose[:2], self.waypoints[0], self._obstacles, settings.clearance_m)
-                if (not self.waypoints or blocked) and new_scan:
-                    # Leave half a grid cell beyond the stop clearance so small
-                    # scan changes do not continually replace a boundary-hugging path.
-                    self.waypoints = plan_waypoints(pose[:2], self.approach_pose[:2], self._obstacles,
-                                                   settings.clearance_m + settings.grid_resolution_m / 2,
-                                                   settings.grid_resolution_m)
-                    if not self.waypoints:
-                        # A new scan can put us inside the optional planning margin.
-                        # Try a route with the full configured robot clearance before
-                        # declaring deadlock; every segment must still pass that check.
-                        self.waypoints = plan_waypoints(pose[:2], self.approach_pose[:2], self._obstacles,
-                                                       settings.clearance_m, settings.grid_resolution_m)
-                    self._reset_reference()
-                if not self.waypoints or (blocked and not new_scan):
-                    if not segment_is_clear(self.approach_pose[:2], self.approach_pose[:2],
-                                            self._obstacles, settings.clearance_m):
-                        return self._stop(time, pose, "Approach target obstructed; waiting for a clear route")
-                    return self._stop(time, pose, "Approach blocked; waiting for a clear route")
-                return self._follow(time, pose, self.waypoints[0], settings.drive_speed_mps, dt)
+                # Report target-relative errors; odometry heading alone does not
+                # show how much alignment remains with the estimated dock.
+                self.status = (f'PBVS approach: error={np.linalg.norm(approach[:2]):.3f} m, '
+                               f'heading={math.degrees(approach[2]):+.1f} deg')
+                return MotionRequest(time, 'ALIGN', self.settings.pbvs_speed_mps,
+                                     self.settings.approach_distance_m)
 
-        if self.phase == "ALIGN":
-            if np.linalg.norm(pose[:2] - self.approach_pose[:2]) > 2 * tolerance:
-                self._change_phase("APPROACH")
-                return self._stop(time, pose, "Returning to approach pose")
-            if abs(wrap_angle(self.docking_pose[2] - pose[2])) > heading_tolerance:
-                self.status = "Aligning with dock"
-                return self._rotate(time, pose, self.docking_pose[2], dt)
-            if not camera_recent or self._good_frames < settings.camera_confirmations:
-                return self._stop(time, pose, "Waiting for reliable dock observations")
-            self._change_phase("DOCK")
+        if self.phase == 'DOCK':
+            if np.linalg.norm(final[:2]) <= tolerance and abs(final[2]) <= heading_tolerance:
+                self.phase = 'DONE'
+                return self._stop(time, 'Docked')
+            # Restore the approach alignment if a pose correction reveals a large error.
+            x, y, yaw = dock_base
+            lateral = -math.sin(yaw) * x + math.cos(yaw) * y
+            if np.linalg.norm(final[:2]) > tolerance and (
+                    abs(lateral) > max(.08, 2 * tolerance) or abs(final[2]) > math.radians(35)):
+                self.phase = 'ALIGN'
+                return self._stop(time, 'Dock alignment lost; returning to PBVS approach')
+            self.status = (f'PBVS docking: error={np.linalg.norm(final[:2]):.3f} m, '
+                           f'heading={math.degrees(final[2]):+.1f} deg')
+            return MotionRequest(time, 'DOCK', self.settings.dock_speed_mps, self.settings.dock_distance_m)
 
-        # Keep obstacle checks active during docking. Marker loss pauses the approach.
-        if not camera_recent:
-            return self._stop(time, pose, "Dock marker lost; waiting for a reliable observation")
-        if not segment_is_clear(pose[:2], self.docking_pose[:2], self._obstacles, settings.clearance_m):
-            return self._stop(time, pose, "Dock approach obstructed")
-        if np.linalg.norm(pose[:2] - self.docking_pose[:2]) <= tolerance:
-            if abs(wrap_angle(self.docking_pose[2] - pose[2])) <= heading_tolerance:
-                self._change_phase("DONE")
-                return self._stop(time, pose, "Docked")
-            self.status = "Finishing dock alignment"
-            return self._rotate(time, pose, self.docking_pose[2], dt)
-        return self._follow(time, pose, self.docking_pose[:2], settings.dock_speed_mps,
-                            dt, start=self.approach_pose[:2])
+        self.status = 'LQI: approaching the coarse dock region (free arrival heading)'
+        return self._tracking_request(state, self.settings.coarse_distance_m, self.settings.drive_speed_mps, perception)
+
+    def allow_motion(self, request: MotionRequest, v: float, omega: float,
+                     perception: PerceptionOutput) -> bool:
+        """Apply the LiDAR stop layer to the actual command, including curved/reverse motion."""
+        if request.stop_requested:
+            return False
+        if motion_is_clear(perception.lidar_points_base, v, omega, self.settings.clearance_m):
+            return True
+        # Restart from the current estimate when clearance returns. The reference
+        # must not continue along its trajectory while the robot is held stopped.
+        self._trajectory.reset()
+        self._search_active = False
+        if request.mode == 'EXPLORE':
+            self.phase = 'SCAN'
+            self._search_remaining = self.settings.search_spin_s
+        if request.mode in ('APPROACH', 'AVOID'):
+            self._motion_blocked = True
+            self._detour.target = None
+        self.status = 'Motion blocked by LiDAR; waiting for a clear command'
+        return False

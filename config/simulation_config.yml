@@ -1,13 +1,14 @@
 # Restart the simulation after editing. Positions are in metres, angles in degrees.
+# Simulation placement only; navigation never receives these robot/dock poses.
 # World yaw: 0 faces +X, 90 faces +Y, 180 faces -X.
 robot:
   x: 6.5
-  y: -2.5
+  y: -2.0
   yaw_deg: 180.0
 
 dock:
   x: -0.8
-  y: 2.4
+  y: 0
   yaw_deg: 0
 
 # Some alternative robot/dock starting poses:
@@ -40,25 +41,40 @@ lidar:
 estimation:
   update_hz: 50.0
   noise_seed: 42
-  initial_position_std_m: 0.05
-  initial_heading_std_deg: 5.0
   process_position_std_m_per_sqrt_s: 0.01
   process_heading_std_deg_per_sqrt_s: 2.0
 
+# Local odometry starts at the first usable marker; the unknown dock is estimated.
 # Robot-base target distances from the dock origin along its outward-facing +X.
 # Clearance includes the robot footprint and a margin, not just the LiDAR origin.
 navigation:
-  approach_distance_m: 0.5
+  # LQI reaches this point along the dock normal; arrival heading stays free.
+  # Tolerance is distance to that point, not distance to the dock itself.
+  coarse_distance_m: 1.5
+  coarse_tolerance_m: 0.25
+  # PBVS then reaches/aligns at approach_distance_m before final docking.
+  pbvs_speed_mps: 0.15
+  approach_distance_m: 0.7 # Set it quite far away
   dock_distance_m: 0.30
-  drive_speed_mps: 0.15
+  # Travel faster in open space; keep final docking slow for precision.
+  # These are command limits, so ramps, turns and wheel limits can reduce speed.
+  drive_speed_mps: 0.22
   dock_speed_mps: 0.06
-  turn_speed_rad_s: 0.4
-  acceleration_mps2: 0.25
-  clearance_m: 0.27
-  grid_resolution_m: 0.1
+  turn_speed_rad_s: 0.6
+  clearance_m: 0.25
   position_tolerance_m: 0.03
   heading_tolerance_deg: 3.0
-  camera_timeout_s: 0.5
+  # Continue on encoder prediction after acquisition; no marker-loss timeout.
   lidar_timeout_s: 0.5
-  camera_confirmations: 3
-  reference_lead_m: 0.12
+  # Timed commands before marker acquisition; actual angle/distance are not measured.
+  search_spin_s: 20.0
+  search_drive_s: 3.0
+  # Stop/report if estimated position fails to progress during boundary following.
+  progress_timeout_s: 30.0
+  # Follow one side of a LiDAR cluster until the goal corridor clears.
+  # Connect neighbouring returns up to this gap; physical clearance stays separate.
+  boundary_join_gap_m: 0.8
+  detour_step_m: 0.4
+  detour_speed_mps: 0.14
+  # Total time budget for obstacle detours, independent of marker visibility.
+  detour_timeout_s: 180.0

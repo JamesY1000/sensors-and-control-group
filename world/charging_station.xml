@@ -6,7 +6,7 @@
     <material name="create3_dock_black" rgba="0.12 0.13 0.15 1" specular="0.25" shininess="0.25"/>
     <material name="create3_dock_white" rgba="0.85 0.85 0.85 1" specular="0.25" shininess="0.25"/>
 
-    <!-- DICT_4X4_50, ID 0: 0.20 m black marker, 0.04 m white margin per side. -->
+    <!-- DICT_4X4_50, ID 0: 0.40 m black marker, 0.08 m white margin per side. -->
     <texture name="aruco_0" type="2d" file="marker_0.png"/>
     <material name="aruco_0" texture="aruco_0" specular="0" shininess="0" reflectance="0"/>
     <!-- ID 1: 0.04 m black square in a 0.06 m panel, 0.01 m margins.
@@ -37,17 +37,18 @@
            Panel bottom is z=0.12 m, above the housing top (~0.102 m). -->
       <geom name="station_panel_post" type="box" pos="-0.061 0 0.11"
         size="0.008 0.009 0.11" rgba="0.20 0.22 0.25 1"/>
-      <geom name="station_back" type="box" pos="-0.056 0 0.26"
-        size="0.004 0.144 0.144" rgba="0.20 0.22 0.25 1"/>
+      <geom name="station_back" type="box" pos="-0.056 0 0.40"
+        size="0.004 0.284 0.284" rgba="0.20 0.22 0.25 1"/>
       <!-- The texture is oriented correctly on the +X face. Its white border
-           is included in the 0.28 m panel; keep it around the 0.20 m marker. -->
-      <geom name="station_marker_panel" type="box" pos="-0.051 0 0.26"
-        size="0.001 0.14 0.14" material="aruco_0"
+           is included in the 0.56 m panel; keep it around the 0.40 m marker.
+           Raise the centre to keep the panel bottom at z=0.12 m. -->
+      <geom name="station_marker_panel" type="box" pos="-0.051 0 0.40"
+        size="0.001 0.28 0.28" material="aruco_0"
         contype="0" conaffinity="0" density="0" group="2"/>
       <!-- Exact visible marker-face centre and OpenCV ArUco axes:
            x right in a front view (+Y), y up (+Z), z out of the panel (+X).
            This ground-truth site is hidden from the robot camera. -->
-      <site name="aruco_marker_0" pos="-0.05 0 0.26"
+      <site name="aruco_marker_0" pos="-0.05 0 0.40"
         xyaxes="0 1 0 0 0 1" size="0.01" rgba="1 0 1 1" group="5"/>
 
       <!-- Close-range marker remains visible after the large panel leaves the

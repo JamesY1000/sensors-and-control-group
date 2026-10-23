@@ -1,451 +1,394 @@
 # Sensors and Control — Track A
 
-A MuJoCo simulation of the **TurtleBot3 Waffle Pi** in an **8 × 6 m room** with
-two tables and four chairs as fixed obstacles, plus a **Create 3 charging dock
-with approach and close-range ArUco panels**. By default the robot starts at (−0.5, −2.5),
-in the southwest corner, facing +X (0°). The dock is near
-the east wall, facing -X. Both starting poses are configurable.
-
-## Current capabilities
-
-`main.py` runs sensing, perception and the pose EKF in both the viewer and
-headless mode. Each scheduled update reads noisy wheel encoders, predicts
-`[x, y, yaw]` and its 3×3 covariance, then corrects with a fresh, reliable
-camera-derived robot world pose when one is available.
-
-| Component | Current setup |
-| --- | --- |
-| Wheel encoders | Accumulated wheel angles in radians; Gaussian angle noise from the sensor XML (σ = 0.01 rad by default) |
-| 2D LiDAR | 360 beams, 360° coverage, 0.16–8 m range, 5 Hz; based on the LDS-02 |
-| RGB camera | Pi Camera v2-based model, 640 × 480 at 30 Hz; vertical field of view and mounting set in YAML |
-| Shared update loop | 50 Hz by default, set by `estimation.update_hz` |
-
-The shared loop keeps encoder prediction and camera acquisition/correction at
-the same timestamp. Camera and LiDAR readings retain their own acquisition
-rates; cached images are not repeatedly fused. Encoder noise and camera/LiDAR
-noise use independent random streams derived from the configured seed.
-
-The terminal prints estimated world pose, one-standard-deviation uncertainty
-(`sigma`), and camera corrections/frames about once per simulation second.
-A zero correction count is normal when the marker is out of view or its pose
-is ambiguous. The estimator uses the configured robot pose as a declared
-starting-pose prior and the installed dock as a known landmark map. The main
-loop does not read live simulator robot pose or print a ground-truth comparison.
-Rewinding simulation time recreates the estimator and sensor sampling state.
-
-By default the wheels stay stopped for sensor checks. **Use `--navigate` to
-enable autonomous approach and docking.** Navigation plans from the estimated
-world pose and LiDAR points; the controller tracks its references using that
-same estimate. LiDAR does not correct the EKF. Electrical charging is not simulated.
+A TurtleBot3 Waffle Pi simulation in an 8 × 6 m room with two tables, four
+chairs, and a charging dock carrying two ArUco markers. The autonomy pipeline
+has no known robot starting pose, dock world pose, room coordinates or room dimensions.
+The room dimensions above describe the simulation, not an algorithm input.
 
 ## Run the simulation
 
-Use **Python 3.12 or newer**. From the repository root:
+Use Python 3.12 or newer from the repository root:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install -r requirements.txt
-```
-
-On Windows PowerShell, use `python` instead of `python3` and activate the
-environment with `.venv\Scripts\Activate.ps1`.
-
-```bash
-# Open the viewer and run sensing/estimation until the window closes.
-python3 -m track_a_mobile_robot.main
-
-# Enable autonomous approach, alignment and docking.
 python3 -m track_a_mobile_robot.main --navigate
-
-# Run the same sensor/estimator loop without the viewer for five seconds.
-python3 -m track_a_mobile_robot.main --headless --seconds 5
-
-# An explicit configuration path is optional; this is the default file.
-python3 -m track_a_mobile_robot.main --config config/simulation_config.yml
 ```
 
-The launcher accepts `--config`, `--headless`, `--navigate` and `--seconds`. Without
-`--seconds`, headless runs last two seconds and viewer runs continue until the
-window closes. Wheel commands come from the controller with `--navigate`, or
-stay at zero otherwise. Viewer actuator sliders do not override these commands.
+Without `--navigate`, the wheels remain stopped for sensor checks. Optional
+`--config config/simulation_config.yml` selects the configuration. Use
+`--headless --seconds 5` for a bounded run without a GUI. Headless defaults to
+two simulated seconds; GUI runs continue until closed unless `--seconds` is set.
+On Windows use `python` and activate `.venv\Scripts\Activate.ps1`.
 
-Viewer synchronisation is limited to 30 Hz of wall-clock time instead of every
-physics step. Physics still runs at 500 Hz, estimation/control at the configured
-50 Hz, and the camera at 30 Hz of simulation time. The loop accounts for sensor
-processing time when pacing the simulation, sleeping only when it is ahead of
-real time. Headless runs do not apply this pacing limit.
+## Sensor-only acquisition and docking
 
-The viewer includes a live robot-camera inset at the bottom-left of the scene.
-It shows the same image used by perception, with marker outlines, IDs and axes.
-Green outlines indicate reliable marker orientation; orange indicates ambiguity.
-The header shows the image timestamp and whether that frame supplied an EKF
-correction, had a marker pose that was not accepted, or had no usable marker.
-The preview stays visible between camera frames and scales to fit the window;
-it is hidden when the scene area is too small. Headless runs do not create a preview.
+1. **SCAN / EXPLORE:** send a timed turning command (`search_spin_s`, 20 s).
+   When the forward LiDAR corridor is clear, drive briefly (`search_drive_s`, 3 s)
+   and scan again. These commands do not use odometry, LQI or a visited-position
+   map. LiDAR checks every command; blocked drives stop and return to scanning.
+   Timings specify commands, not measured rotation angles or travel distances.
+2. **Acquire:** the first usable marker interrupts exploration immediately. Define
+   the robot pose as `(0, 0, 0)`, initialise the dock from the relative camera pose
+   and save the current encoder readings as the baseline. Earlier wheel travel is
+   excluded. Subsequent camera observations correct this estimate without resetting it.
+3. **APPROACH:** LQI turns towards and tracks one full straight reference to a coarse target
+   1.5 m in front of the estimated dock. Arrival heading is not constrained.
+   Handover requires being within 0.25 m of that specific offset point, plus a
+   clear corridor to the PBVS approach offset. Being close to the dock from the
+   side is insufficient. The stored EKF estimate supports handover during occlusion.
+4. **ALIGN:** PBVS directly commands forward/angular velocity to reach the configured
+   approach offset (currently 0.70 m) and face into the dock. There is no timed trajectory in this phase.
+5. **DOCK:** PBVS moves to the 0.30 m offset at the lower docking speed.
+6. **DONE:** stop when both estimated position and heading meet their tolerances.
 
-The viewer also draws a floor overlay using the estimated world frame:
+Odometry starts at first acquisition. A detected ID alone is insufficient:
+the marker pose must pass the size, reprojection, ambiguity and physical-consistency
+checks.
 
-- Cyan lines and dots: the remaining waypoint route, or final docking segment.
-- Orange dots: the latest LiDAR hit positions projected onto the floor; grey when stale.
-- Yellow marker and heading line: the current trajectory reference.
-- Blue line and circle: estimated robot heading and navigation stop clearance.
-- Green and purple markers: the approach and final docking targets.
+After first acquisition, all travel phases continue using encoder prediction and
+the stored joint robot/dock estimate for as long as necessary. There is no camera-loss
+timeout, reacquisition turn, WAIT_MARKER state or fresh-frame confirmation gate.
+New accepted camera poses still correct the EKF when they arrive, without resetting
+odometry. ALIGN and DOCK use the predicted relative dock pose during occlusion;
+completion is based on estimated pose tolerances. Longer gaps can accumulate drift.
+LiDAR freshness/collision stops, obstacle-recovery limits and DONE remain active.
 
-A legend and navigation status appear at the top-left. The route disappears
-when no valid route is available; a stopped reference is not drawn as a motion
-target. LiDAR hits are measurements, not the planner's inflated obstacle grid.
-The overlay refreshes at 10 Hz, caches each scan's world points, and uses the
-[MuJoCo viewer's separate `user_scn`](https://mujoco.readthedocs.io/en/stable/python.html#passive-viewer).
-It does not add physical obstacles or appear in the robot's camera images.
-Without `--navigate`, the viewer still shows LiDAR hits and estimated heading.
+## Frames and estimation
 
-Headless runs still render camera images. On Linux, the launcher selects EGL
-for the offscreen camera in both modes unless `MUJOCO_GL` is already set. This
-keeps camera rendering separate from the viewer's GLFW context. A working
-offscreen graphics backend is required; the viewer uses the desktop graphics backend.
+The moving robot frame is used for sensor measurements. A fixed **local odometry
+frame** starts at the first accepted marker observation and holds the joint robot/dock estimate.
+Neither frame is aligned to the simulator world. Navigation derives the target
+from the estimated dock, and control compares estimated and reference robot poses
+in the same local frame. Translating/rotating that frame does not change commands.
 
-To inspect camera corrections near the dock, set the YAML robot pose to
-`x: 6.0`, `y: 0.0`, `yaw_deg: 0.0`, then rerun. The default corner start may
-remain prediction-only while stationary because the markers are too far away
-or outside the camera view.
+The EKF's internal state is
+`[robot_x, robot_y, robot_heading, dock_x, dock_y, dock_heading]` in local odometry.
+The initial robot identity defines the frame, with zero robot covariance by
+coordinate convention. The dock starts with camera measurement uncertainty.
+Robot/dock cross-covariance develops during later corrections and is retained;
+the first noisy dock observation is not treated as a perfectly known landmark.
 
-## Navigation and control
+Encoder increments predict the robot while the dock is stationary. A camera
+observation measures `R(robot_heading).T @ (dock_xy - robot_xy)` and the wrapped
+heading difference. Its Jacobian is with respect to both robot and dock states.
+Correction uses `S = H @ P @ H.T + R`, normalized innovation gating at 11.345
+(99% for three components), and Joseph-form covariance propagation. Rejected or
+reused observations do not produce EKF corrections. Absolute world pose
+remains unobservable; the robot does not need it for relative docking.
 
-1. **APPROACH:** derive the approach pose from the configured dock pose. Take a
-   direct path if clear; otherwise run A* through a grid inflated by robot
-   clearance and simplify the result into waypoints. Check the next segment
-   against incoming LiDAR scans and replan if it becomes blocked.
-2. **ALIGN:** face into the dock and require consecutive reliable camera-pose
-   observations. A raw or ambiguous marker detection does not confirm the dock.
-3. **DOCK:** follow a slow straight reference along the dock centreline. Pause
-   when reliable camera observations become stale or LiDAR reports an obstruction.
-4. **DONE:** stop once estimated position and heading are both within tolerance.
+`StateEstimate` returns `pose_local`, robot covariance, `dock_pose_local` and dock
+covariance. Before acquisition the dock fields are `None`. The differential-drive
+motion model remains unchanged. Camera and encoder updates share acquisition time.
 
-Each straight segment begins with an in-place turn. Navigation generates a
-time-varying pose and velocity reference with acceleration/braking and a limited
-lead over the robot; the LQI controller tracks translating segments. Alignment
-uses heading feedback with integral action and zero forward velocity. Wheel commands obey the
-actuator speed limits. Navigation decides where to go; control decides how to
-track the reference. Neither reads the live ground-truth robot pose.
+## Coarse LQI approach and PBVS docking
 
-The default approach and final robot-base targets are 0.50 m and 0.30 m out
-from the dock origin. Both markers confirm the same dock target. The final
-offset leaves room for the robot footprint and noisy LiDAR returns from the
-dock; it represents a geometric docking demonstration, not electrical contact.
+Navigation contains `MotionTrajectory`, used after acquisition during coarse
+approach and detours to produce reference pose and forward/angular velocity.
+The target comes from the camera/encoder EKF throughout approach and docking.
+The dock's measured orientation defines its outward normal; the selected offset
+along that normal gives the target position, with the robot facing into the dock.
 
-This is a small planner using the latest scan, not a persistent occupancy map.
-It prefers an extra half-cell of planning clearance. If that search fails, it
-retries with the configured robot clearance (27 cm by default); it never drops
-below that safety distance. Exact start/goal positions connect to the grid via
-collision-checked segments, so rounding an endpoint into an inflated cell does
-not itself make a safe endpoint unreachable. A blocked destination is reported
-as `Approach target obstructed`.
-Unobserved space is provisionally traversable. It stops on blocked routes,
-stale scans or obstacles inside its clearance and does not implement automatic
-recovery manoeuvres. Long occlusions and encoder drift still need full-room
-validation across different starts and noise seeds. Run the navigation and
-camera-correction checks with:
+Direct approach turns towards the coarse target if needed, then generates one
+straight trajectory all the way to it. There are no one-metre intermediate stops.
+The entire direct corridor is checked against observed LiDAR obstacles before
+travel, and the remaining reference is rechecked while tracking. If blocked,
+the robot first approaches along a clear prefix with a stand-off, then boundary
+following supplies short detour targets; once the corridor clears,
+navigation generates a new full direct reference from the current estimate.
 
-```bash
-python3 -m unittest discover -s tests -v
+Detours can use circular arcs tangent to the current heading. A bearing beyond
+60 degrees or a blocked arc uses a spot turn first. Coarse approach hands over
+within the tolerance around its stand-off point, without demanding dock-facing
+arrival heading. PBVS then handles the finer position and heading alignment.
+Each segment uses cubic progress `s=3u²-2u³`, where `u` is elapsed time
+divided by duration. Reference velocity starts and ends at zero. Duration limits
+peak speed and acceleration, reserving 20% of the speed limit for feedback.
+Short detours can still slow or stop between segments. There is no A*, occupancy
+grid or global route search; unseen space is not certified clear by a LiDAR check.
+
+`MotionController` applies `u = u_ref - K z`. During curved or straight driving,
+`z = [e_along, e_across, e_heading, integral(e_along)]`, with errors defined as
+estimated minus reference pose in reference-heading axes. The linearised model is:
+
+```text
+e_along_dot   = omega_ref * e_across + delta_v
+e_across_dot  = -omega_ref * e_along + v_ref * e_heading
+e_heading_dot = delta_omega
+integral_dot  = e_along
 ```
 
-Before the chassis/support contact correction, rendered trials used seed 42
-and configured sensor noise: the near-dock start
-`(6.0, 0.0, 0°)` reached `DONE` at 6.12 simulated seconds. At that transition,
-estimated position error was 2.98 cm; the separate simulator-truth score was
-3.52 cm and 0.08° heading error. A second trial starting at 10° reached `DONE`
-at 10.14 s, with a truth-scored position error of 3.51 cm and heading error of
-0.36°. These two trials are not a success-rate estimate.
-The earlier default corner-start trial advanced briefly, then stopped with a blocked
-route before obtaining a camera correction. Full-room completion is therefore
-not established; turning odometry and planning under that uncertainty need
-further work. These results predate the contact correction described below;
-they are not validation of the corrected model. The runtime still uses only
-the estimated pose.
+The gain is computed from the continuous algebraic Riccati equation using SciPy,
+with `Q=diag(4,16,2,4)` and `R=diag(4,1)`. Gains are cached for signed reference
+speeds rounded to 0.01 m/s and turn rates rounded to 0.01 rad/s. At ramp endpoints a minimum design speed of 0.02 m/s
+avoids the uncontrollable zero-speed Cartesian pose linearisation. This is a local
+moving-reference design, not a claim of full-pose stability at rest. Navigation
+starts a new segment if a finished arc leaves significant lateral error. Segments
+start and end at zero reference speed; this is not a continuous-speed spline route.
 
-With the support-contact correction, a 15 s rendered trial using the default
-configuration turned and drove away from the starting corner, reaching an
-estimated `(1.19, -1.68)` m at 14.12 s without the previous blocked-goal stop.
-It had not received a camera correction by 15 s. This verifies the startup
-improvement, not completion of the full-room route.
-A corrected-model near-dock trial from `(6.0, 0.0, 0°)` reached `DONE` at
-5.96 s, with 2.89 cm estimated position error and a truth-scored error of
-2.93 cm and 0.02°. Both rendered trials used seed 42 and the existing sensor
-noise settings.
+In-place turns use a separate heading/integral model with `Q=diag(4,4)` and `R=1`;
+forward velocity stays zero. Integral action is therefore part of an augmented
+LQR design (LQI), rather than hand-added PI terms. Bounded integrals and conditional
+integration limit windup; stops, phase changes and new segments clear the integral.
+Search commands remain primitive timed commands until a usable dock estimate exists.
 
-After adding physical camera-pose validation, EKF innovation gating and the
-planning-margin fallback, the default corner start completed the rendered
-route at 56.74 simulated seconds with seed 42. At `DONE`, estimated target
-error was 2.83 cm; the separate truth score was 2.90 cm and 0.045 degrees.
-Truth was used only for scoring, never for control or measurement acceptance.
-All 20 unit tests passed. This is one successful route, not a success-rate claim.
-A separate `(6.0, 0.0, 0°)` trial remained in `ALIGN` at 20 seconds: the existing
-IPPE ambiguity filter rejected 115 of 120 frames sampled between 4 and 8 s,
-while none failed the new height/tilt checks. Near-frontal marker ambiguity and
-viewpoint recovery remain limitations of the current docking confirmation logic.
+Significant changes in the estimated target or excessive tracking error restart
+the reference from the current estimate. A stop also resets the reference so it
+cannot advance while the robot is held still. Small target corrections are included
+when the next segment is generated. Large estimated final misalignment returns
+to the approach offset; marker loss does not block these transitions.
 
-## Earlier experiment results
+For ALIGN and DOCK, `MotionController` switches to planar position-based visual
+servoing (PBVS), using `StateEstimate.dock_pose_base`. This is the camera/encoder
+EKF's relative pose, not raw camera data or simulator truth. Navigation supplies
+an offset, with no trajectory reference. PBVS calculates target distance `rho`,
+bearing `alpha`, and remaining orientation `beta`, then uses proportional distance
+feedback and `omega = 1.5*alpha - 0.5*beta`. Large bearing errors cause a turn first;
+small overshoots allow reversing while facing the dock. Once position is within
+tolerance, only heading is corrected. Velocity and wheel limits still apply.
+LQI integrals are cleared at handover and are not part of PBVS.
+Small minimum driving/heading-correction commands counter the simulated
+low-speed friction outside tolerance; they are still capped by the configured
+speed limits. Inside both tolerances the command is zero.
+The heading-only minimum is 0.30 rad/s: the wheel motor gain and joint friction
+produce an approximate 0.23 rad/s in-place turning deadband. The former
+0.15 rad/s minimum could leave the robot almost stationary in ALIGN despite
+fresh camera measurements. ALIGN/DOCK logs show position and heading errors
+relative to the estimated target, rather than requiring interpretation of odometry.
 
-The results below were recorded with the earlier autonomous range/bearing
-fusion pipeline, before the current sensing/estimation rebuild. They are
-historical measurements, not validation of the current full-pose EKF loop.
-The earlier autonomous launcher and its command-line flags are not supported
-by the current `main.py`.
+Before tracking, navigation uses the endpoints of a straight reference or samples
+a detour curve at at most 2.5 cm spacing. It checks the swept circular footprint along every sampled chord
+against grouped LiDAR returns, with 1 cm extra padding for the chord approximation.
+It also checks the connection from the actual estimated position to the remaining
+reference. A blocked arc is retried with a spot turn; if that also fails, navigation
+stops and selects a detour. This check repeats during tracking using the latest scan.
 
-That implementation passed a close-range estimated-state docking trial with
-injected noise. Full-room completion was not established: a 60 s default-route
-trial accepted 314 visual corrections, then lost the marker during obstacle
-avoidance and accumulated severe pose drift before timing out.
+Before applying each command, LiDAR separately checks its swept circular footprint over the
+next second, including curved, reverse and in-place motion. A blocked command
+stops immediately; approach navigation can choose a detour on the next update. Sensor freshness, minimum-range hits,
+robot clearance and wheel-speed limits remain active. Sensor blind spots and a
+single scan height limit what this check can detect.
 
-Recorded seed-42 short trials used the installed markers, a known initial pose,
-identical encoder samples for fused and odometry estimates, and the earlier
-noise tuning. Values are RMSE:
+The 0.30 m target is geometric docking; electrical contact is not simulated.
 
-| Motion | Encoder position | Fused position | Encoder heading | Fused heading |
-| --- | --- | --- | --- | --- |
-| Straight, 8 s | 3.44 cm | 0.34 cm | 1.18° | 0.15° |
-| Arc, 8 s | 2.28 cm | 0.94 cm | 7.78° | 2.28° |
-| Spin, 2 s | 0.94 cm | 2.32 cm | 7.13° | 1.21° |
+## LiDAR boundary following
 
-Fusion improved heading in these trials but did not improve every position
-metric. These short simulation measurements do not establish hardware accuracy,
-full-room docking success or robustness to long marker occlusions.
+An observed obstacle anywhere along the direct goal corridor interrupts the full
+reference. If it is distant, LQI first follows the checked clear prefix, leaving
+a one-metre stand-off (increased for larger clearance/detour settings). Boundary
+following starts only on reaching that vicinity; a far obstacle does not choose
+a passing side immediately. Navigation connects neighbouring
+LiDAR returns separated by at most `boundary_join_gap_m` (0.8 m), then follows
+one passing side using short targets and LQI. Joining is separate from the robot's
+0.27 m clearance: it closes small gaps between legs without inflating every wall
+by half the joining distance. Hidden or widely separated furniture parts remain
+separate; this is not object recognition.
 
-## Simulation configuration
+The follower starts with the obstacle blocking the goal corridor, rather than a
+nearer side wall. It retains its target until reached/obstructed and advances the
+contact within a local section of the previously followed boundary. It returns towards the goal
+only after making progress past the encounter distance and seeing a clear corridor
+for 0.4 s. An entirely cleared scan also releases the detour. Checks cover the sensed
+corridor only; unseen space is not proven free.
 
-Edit **`config/simulation_config.yml`**, then restart the simulation. This single file
-controls the robot and dock starting poses, camera mounting and field of view,
-LiDAR mounting, estimator timing/uncertainty, and navigation settings:
+A return to the encounter position after travelling around a loop, 30 s without
+position progress, or a 180 s overall detour budget stops motion with an explicit
+status. Marker loss does not interrupt an active detour merely because the dock
+is occluded. After leaving the boundary, travel resumes from the stored dock estimate.
+Actual commands are separately checked against LiDAR, including reverse/curved
+motion. This local behaviour does not guarantee finding a route through every
+concave obstacle or furniture arrangement.
 
-```yaml
-robot:
-  x: -0.5
-  y: -2.5
-  yaw_deg: 0.0
-  # For a near-dock start, use x: 6.0, y: 0.0, yaw_deg: 0.0.
+## Simulation versus robot inputs
 
-dock:
-  x: 6.9
-  y: 0.0
-  yaw_deg: 180.0
+`main.load_spec()` applies YAML robot/dock world poses only to place physical objects.
+`create_demo()` receives estimation settings, not the spawn-pose configuration;
+`Navigator` receives navigation settings and estimates, not a dock map.
+`Perception` reads sensors and fixed sensor mounting calibration. It never reads
+marker sites, installed marker world transforms, or the live robot pose.
+`SensorDisplay` alone reads the live robot transform to place decorative 3D
+graphics in the viewer. It sends no poses or other values back to robot algorithms.
 
-camera:
-  position_m: [0.076, 0.0, 0.103]
-  rpy_deg: [-90.0, 0.0, -90.0]
-  fov_y_deg: 48.8
+Known physical calibration is still necessary: camera intrinsics/extrinsics,
+wheel dimensions, marker sizes, and the rigid marker-to-dock mounting offsets.
+`perception.marker_mounts()` specifies those offsets in the dock's own frame.
+They let both markers describe the same unknown dock origin. Moving the dock in
+the room requires no changes to these values. Altering the physical marker mount
+requires updating this calibration, just as on hardware.
 
-lidar:
-  position_m: [-0.049, 0.0, 0.1255]
-  yaw_deg: 0.0
+Offline `scripts/perception_diagnostics.py` and `evaluation.py` contain explicitly
+separate truth-based scoring/calibration helpers. They are not imported by the
+runtime pipeline. The current sensor-only rendered trials do not use them or
+read true poses, including for scoring. MuJoCo itself necessarily knows object
+poses to simulate sensors and collisions; these are not supplied to the robot.
 
-estimation:
-  update_hz: 50.0
-  noise_seed: 42
-  initial_position_std_m: 0.05
-  initial_heading_std_deg: 5.0
-  process_position_std_m_per_sqrt_s: 0.01
-  process_heading_std_deg_per_sqrt_s: 2.0
+## Configuration and sensors
 
-navigation:
-  approach_distance_m: 0.5
-  dock_distance_m: 0.30
-  drive_speed_mps: 0.15
-  dock_speed_mps: 0.06
-  turn_speed_rad_s: 0.4
-  acceleration_mps2: 0.25
-  clearance_m: 0.27
-  grid_resolution_m: 0.1
-  position_tolerance_m: 0.03
-  heading_tolerance_deg: 3.0
-  camera_timeout_s: 0.5
-  lidar_timeout_s: 0.5
-  camera_confirmations: 3
-  reference_lead_m: 0.12
-```
+`config/simulation_config.yml` contains simulation placement, sensor calibration,
+estimation noise and navigation settings. Preserve safe physical spawn clearance.
+Robot/dock `x`, `y`, `yaw_deg` are simulation placement only. Sensor mounting
+positions are in the base frame (+X forward, +Y left, +Z up). Camera optical
+axes are +X right, +Y down, +Z forward, with RPY applied as `Rz @ Ry @ Rx`.
+Intrinsics derive from the configured vertical FOV and image size; distortion is
+zero in this renderer. A checkerboard is not needed for the running simulation.
 
-Robot and dock `x`/`y` are world coordinates in **metres**. Their `yaw_deg` is
-counterclockwise heading: 0 faces +X (east), 90 faces +Y, and 180 faces -X.
-The dock origin is at ground level, and its local +X points out of its front.
-The dock, post and markers move together. For the near-dock setup, edit only
-the robot entry to `(6.0, 0.0, 0.0)`; no second configuration file is needed.
-
-Sensor positions are in the robot base frame: +X forward, +Y left, +Z up.
-Camera `rpy_deg` rotates the OpenCV optical frame into that base frame using
-`Rz(yaw) @ Ry(pitch) @ Rx(roll)`. The default angles align optical +X right,
-+Y down and +Z forward with the robot. `fov_y_deg` is the vertical field of view.
-LiDAR stays horizontal; its `yaw_deg` rotates its forward direction around
-the base's +Z axis.
-
-All six `estimation` fields are required:
-
-| Field | Meaning |
+| Component | Setting |
 | --- | --- |
-| `update_hz` | Shared sensing/perception/EKF updates per second; positive and no faster than physics |
-| `noise_seed` | Nonnegative integer seed for repeatable independent encoder and perception noise streams |
-| `initial_position_std_m` | Initial standard deviation for each of x and y, in metres; must be positive |
-| `initial_heading_std_deg` | Initial heading standard deviation, in degrees; must be positive |
-| `process_position_std_m_per_sqrt_s` | Model-noise standard deviation for each of x and y, in m/√s; may be zero |
-| `process_heading_std_deg_per_sqrt_s` | Model-noise heading standard deviation, in degrees/√s; may be zero |
+| Physics | 500 Hz |
+| Estimation/control | 50 Hz by default |
+| Camera | 640 × 480, 30 Hz |
+| LiDAR | 360 beams, 0.16–8 m, 5 Hz |
+| GUI sync | Up to 30 Hz of wall time |
+| Local map | 10 Hz |
 
-These standard deviations are **initial tuning assumptions, not calibrated
-accuracy**. The launcher converts headings to radians and squares the standard
-deviations to form the diagonal initial covariance and process covariance per
-second. Prediction multiplies the latter by elapsed time. Encoder angle noise
-comes separately from the sensor XML; the filter uses increment variance
-`2σ²`, an approximation that ignores correlation between successive angle
-differences. Camera-pose covariance is described below.
+`estimation` contains `update_hz`, `noise_seed`,
+`process_position_std_m_per_sqrt_s` and `process_heading_std_deg_per_sqrt_s`.
+There is no world-start covariance or known starting pose. Process standard
+deviations are squared and multiplied by elapsed time. Encoder increment
+variance uses `2*sigma**2`, an approximation ignoring inter-increment correlation.
+The initial dock uncertainty comes from the camera. All noise values are tuning
+assumptions, not calibrated accuracy claims.
 
-`scene_config.py` reads and validates the YAML. `main.load_spec()` applies it
-before MuJoCo compiles the scene. `sensing.py` and `perception.py` then derive the
-camera intrinsic matrix and fixed sensor transforms from that model, so the rendered
-camera, LiDAR rays and perception calculations use the same settings. A
-checkerboard calibration is not needed to run this simulated camera; the
-offline calibration tools provide additional checks.
+## Markers and perception
 
-The same YAML robot pose also supplies the estimator's starting-pose prior;
-the `estimation` section supplies its uncertainty. `main.update_demo()` connects
-sensing, perception and estimation. With `--navigate`, the main loop then runs
-navigation and control at the same rate. Navigation distances and speeds are
-in metres and seconds; `turn_speed_rad_s` is in radians per second. Clearance
-is measured from the robot base, including its footprint and a margin. Camera
-and LiDAR timeouts determine when missing observations pause motion. The lead
-limit keeps the trajectory reference from running far ahead of the estimate.
-Marker mounting geometry and room furniture remain in the XML files. Allow
-clearance for the robot and dock; valid configuration values do not guarantee
-a collision-free placement or route.
-
-```bash
-python3 -m track_a_mobile_robot.main --config config/simulation_config.yml
-```
-
-The launcher uses this file by default, relative to the repository. An explicit
-`--config` path is relative to the current directory. Loading XML directly in a
-separate MuJoCo viewer bypasses these YAML settings.
-
-## Room and furniture
-
-The room interior spans **x = −1 to 7 m** and **y = −3 to 3 m**. Two tables sit
-at (2, 1.55) and (4.5, −1.55), each with two chairs facing the table. The robot
-starts 0.5 m in from the west and south walls, at (−0.5, −2.5). A 0.94 m wide
-strip along y = 0 is free of furniture and leads to the dock at (6.9, 0);
-navigate from the corner into this central approach. The low walls keep the
-scene easy to inspect from above.
-
-Each table is 1.4 × 0.8 m and 0.75 m tall; each chair is 0.46 × 0.44 m and
-0.85 m tall. Separate legs, seats, backs and tabletops have their own collision
-shapes. The low LiDAR scan sees the legs, and the robot can move under furniture
-where its full body fits between the legs and beneath the seat or tabletop.
-Furniture is fixed in place; the robot cannot push it around.
-
-Edit the placement frames in `world/room_with_charger.xml` to rearrange the
-tables and chairs. Their reusable geometry and materials live in
-`world/furniture/table.xml` and `world/furniture/chair.xml`. Robot and dock
-starting poses and sensor settings remain in `config/simulation_config.yml`.
-
-## Marker panel and perception
-
-The dock uses two markers from `DICT_4X4_50`, each with a white margin:
-
-| Marker | Black square | White panel | Margin per side | Centre above floor |
+| Marker | Black square | White panel | Margin per side | Centre above dock origin |
 | --- | --- | --- | --- | --- |
-| ID 0: approach | 20 × 20 cm | 28 × 28 cm | 4 cm | 26 cm |
+| ID 0: approach | 40 × 40 cm | 56 × 56 cm | 8 cm | 40 cm |
 | ID 1: final approach | 4 × 4 cm | 6 × 6 cm | 1 cm | 12 cm |
 
-Pose estimation uses the **black square size**, selected by ID from
-`MARKER_SIZES_M`; the surrounding white panel is not included in that size.
-ID 1's face is at dock-local `(−0.025, 0, 0.120)` m. The camera mounting is
-unchanged. Earlier installed
-render checks detect ID 1 from 0.9 m through 0.2 m along the tested central
-approach and at the final pose with ±2 cm lateral / ±3° heading offsets.
-The original large panel leaves the image at close range; the low marker
-provides the handover. These visibility checks do not establish docking success.
-The central approach has a clear view of the panel. From the default corner
-start, the robot needs to turn towards the dock and approach before the marker
-is large enough in the image for reliable detection.
+Both use `DICT_4X4_50`. Their black-square dimensions are in `MARKER_SIZES_M`;
+white borders are excluded. Camera-to-marker pose is transformed through the
+camera and marker mount calibrations to produce `DockObservation.pose_base`.
+The largest reliable marker is selected once per image, avoiding double-counting
+correlated measurements from two markers in the same frame.
 
-The marker's installed world pose is derived from the configured model's fixed
-body/site transforms, so changing the dock pose also changes its known landmark
-map. This uses model constants, not a live measurement of the robot's true pose.
-`Perception` uses this map to turn a camera-relative marker pose into a robot
-world-pose measurement. `main.update_demo()` reads noisy encoders, predicts the
-pose, calls `perception.update(data)`, then passes a fresh `pose_observation` to
-`estimator.correct()`. It returns the estimate and perception output for
-navigation and control.
+The flat-floor check rejects relative dock heights beyond 5 cm and upright-axis
+tilts beyond 10 degrees. The dock's world location is not needed for this check.
+Small footprints, poor reprojection fits and ambiguous planar orientations are
+also rejected. Near-frontal planar ambiguity can still delay usable measurements.
+Camera covariance models relative translation and heading, with a small
+correlated contribution from the marker-to-dock mounting offset.
 
-Prediction precedes correction at the camera's acquisition timestamp. Repeated polls, hidden
-markers and ambiguous orientations produce no new pose measurement. If both
-markers provide reliable poses, perception selects the larger image footprint for
-one correction. Raw detections remain available in `observations.markers`.
+## Display
 
-Before extracting a planar pose, perception rejects solutions placing the base
-origin more than 5 cm above/below the floor or tilting its upright axis by more
-than 10 degrees. These tolerances express this demo's flat-floor model; they
-do not read the robot's live simulator pose. Low reprojection error and a good
-IPPE ambiguity ratio alone are insufficient for accepting a distant marker.
+The GUI contains the robot camera with detection annotations and a separate
+local 2D sensor map. Orange points show LiDAR, blue shows the robot, and
+green shows the coarse target, teal the PBVS approach, purple the final docking
+target, and yellow a short boundary-following target.
+Cyan shows the active trajectory segment and its final heading; a white ring marks
+the current reference tracked by LQI. The grey-blue trail retains up to 600 recent
+estimated robot positions. Turns show a heading arrow at the stationary position.
+This displays the current LQI segment, not a complete planned route. PBVS has
+no timed segment, so its trajectory/reference overlay clears at handover. The map
+uses the current robot frame during exploration and fixed local odometry after
+marker acquisition. Exploration has no pose trail or reference trajectory.
 
-The EKF also gates the wrapped pose innovation using its combined prediction and
-measurement covariance: `innovation.T @ solve(P + R, innovation) <= 11.345`
-(the 99% chi-squared threshold for three components). A rejected frame leaves
-the prediction and covariance unchanged, and is not counted as a correction or
-a dock confirmation. The thresholds and camera covariance remain initial tuning
-assumptions, not a guarantee that every outlier will be rejected.
+The 3D viewer adds a blue clearance circle and heading arrow around the robot,
+a cyan active LQI segment (or heading arc for a turn), and a white reference ring.
+During PBVS it shows a purple target and heading instead of a generated trajectory.
+These decorative geoms are drawn at 10 Hz and cannot affect collisions or the
+camera/LiDAR sensors. Local estimated coordinates are first converted into the
+robot frame, then placed using a display-only simulator robot transform. The
+preview follows the visible robot; it is not a world-frame localisation-error plot.
+The circle shows `clearance_m`, which may differ from the physical chassis outline.
 
-Camera covariance is an initial tuning model in `[x, y, heading]` order:
-translation and heading uncertainty grow for small/distant detections, and
-heading uncertainty also contributes to world-position uncertainty. The
-2 cm translation and 5 degree heading floors are assumptions to validate,
-not measured sensor accuracy. Optional sensor noise is sampled once per
-image/scan and cached between updates. `observations.lidar_too_close` preserves
-below-minimum-range hits for navigation to handle.
+The top-left GUI overlay has two lines: phase/time and status. The terminal prints
+a compact status every two simulated seconds, plus phase/stop changes, with the
+age of the last accepted camera pose and simulation speed (`1.00x` is real time).
+Use `python3 -m track_a_mobile_robot.main --navigate --verbose` to include the
+estimated pose, one-standard-deviation uncertainty and accepted/total camera counts.
+Initial zero robot covariance defines the local frame; uncertainty then grows with
+encoder motion after marker acquisition. Before then, the displayed identity is
+not an accumulated pose estimate.
 
-The diagnostic tools use the same configuration. Put `--config` before the subcommand:
+## Simulation performance
 
-```bash
-MUJOCO_GL=egl python3 -m scripts.perception_diagnostics --config config/simulation_config.yml test --repeats 3
-```
+Camera detection remains at 30 Hz and estimation/control at 50 Hz. LiDAR is
+sampled at 5 Hz; perception now copies and transforms its points only when a new
+scan arrives. Image-noise generation uses one single-precision working buffer
+and performs its arithmetic in place; the Gaussian noise level is unchanged.
+OpenCV uses at most four worker threads to leave CPU time for physics and the
+viewer. The random sequence differs from the previous double-precision sampler,
+but remains reproducible for a fixed seed with this implementation.
 
-Use `calibrate` for the checkerboard and mounting checks, or `sensitivity` for
-mounting-error experiments. These offline checks use simulator truth only to
-set up trials and score measurements; runtime perception does not read it.
+The camera/map overlay is prepared at 10 Hz and sent through a single background
+publisher with a one-item queue. Slow/minimised viewers discard old overlays
+instead of blocking physics and control. The worker only receives prepared images
+and text; it does not read robot state or access the renderer used for perception.
+
+On this laptop's NVIDIA RTX 3050, profiling five simulated seconds with the GUI
+previously took 65.48 s including startup: 54.06 s was spent waiting in synchronous
+`set_images`. With latest-only asynchronous uploads the same run took 8.52 s
+including startup, with the active loop approximately real time. In the headless
+baseline, image-noise generation took 1.58 s while camera rendering took 0.23 s.
+These timings are machine/window-state dependent, not guaranteed frame rates.
+The sandbox used Mesa llvmpipe software rendering; desktop GPU measurements were
+used for the comparison above.
+
+A later GUI profile reproduced a drop to `0.84x` at 44.4 simulated seconds.
+With single-precision camera noise and the OpenCV thread limit, a 45-second run
+stayed near `1.00x`; image-noise time fell from 18.46 s for 1,339 frames to
+12.29 s for 1,350 frames. Sensor rates, noise standard deviation and physics
+timestep were unchanged. These runs use the same scene settings, but the changed
+noise sequence means their estimated trajectories are not identical.
+
+## Validation and limitations
+
+Run `python3 -m unittest discover -s tests -v`. All 68 automated checks pass.
+Checks cover ignored pre-acquisition encoder travel, zero-origin initialisation,
+post-acquisition correction without resetting, timed exploration, LiDAR stops,
+LQI/PBVS tracking, arc kinematics, curved-reference LQI stability, full-curve
+collision checks, turn fallback and nonblocking display uploads. Additional checks
+cover full direct references without intermediate stops, distant new obstacles,
+resuming direct travel after clearance, ignoring obstacles beyond the goal, and
+approaching distant blockers before starting boundary following. Handover checks
+cover side arrivals, starts too close to the dock, rotated dock normals, free
+arrival heading, and a blocked PBVS approach corridor.
+With the stricter stand-off gate, a rendered side-start trial (robot 3, 1.2,
+-90 degrees; dock 2.5, 0, 0 degrees) switched to PBVS at 0.247 m from the
+coarse target and completed estimated docking at 101.64 simulated seconds.
+The controller used only EKF poses; these coordinates placed the test scene.
+A rendered replay of the configured corner start acquired its first marker at
+21.70 s. It now follows the clear direct prefix first and starts boundary following
+at 51.00 s, roughly one metre from the blocking return, rather than choosing a side
+at acquisition while the obstruction is about 3.8 m away. This replay checks the
+avoidance entry only; it does not establish docking success from that start.
+A camera-rendered full-direct-approach trial from robot (6.5, 0, 180 degrees)
+to dock (-0.8, 0, 0 degrees) reached estimated DONE at 99.98 simulated seconds,
+including PBVS alignment and final docking. Simulation placements were supplied
+only to the scene; navigation and control used the joint EKF estimate.
+Before the full-direct-reference change, a rendered trial from robot (5, 0.6, 180 degrees) and dock (2.5, 0, 0 degrees)
+tracked a curved LQI approach with simultaneous forward/angular commands, then
+completed PBVS docking at 41.50 simulated seconds within the estimated tolerances.
+These world coordinates only set the physical test scene; the pipeline starts
+its local frame at first camera acquisition.
+Marker-loss checks cover APPROACH, ALIGN and DOCK through 10,000 s without a
+camera update, including phase transitions and resumed EKF-derived target updates.
+A camera-rendered close-start run withheld all dock observations after 5 s and
+reached estimated DONE at 23.64 s using encoder prediction for the remaining travel.
+
+Camera-rendered headless checks after the PBVS turn correction completed docking
+in 26.42 s from a close start and 118.66 s from the configured centred start
+(robot 6.5, 0, 180 degrees; dock -0.8, 0, 0 degrees). Both finished within the
+estimated 3 cm / 3 degree tolerances. The close-start baseline remained in ALIGN
+after 60 s with the previous minimum turn command.
+Increasing the configured travel/PBVS approach/detour limits to 0.22/0.15/0.14 m/s
+and the turn limit to 0.6 rad/s reduced the centred-start run to 87.40 s, within
+the same estimated docking tolerances. Final docking remains limited to 0.06 m/s.
+Earlier corner and delayed-marker cases encountered a boundary loop and an
+alignment stall respectively; those placements have not been rerun with this fix.
+These checks do not establish reliable completion from every room placement.
 
 ## Key files
 
-- `config/simulation_config.yml`: scene/sensor settings, estimator uncertainty and navigation limits.
-- `track_a_mobile_robot/scene_config.py`: typed YAML configuration and validation.
-- `world/room_with_charger.xml`: floor, walls, obstacle layout and lighting.
-- `world/furniture/`: reusable table and chair models with individual collision legs.
-- `world/charging_station.xml`: dock, post, marker panel and fixed marker frame.
-- `world/assets/create3_dock/`: dock meshes, source details and retained licence.
-- `robot_model/turtlebot3_waffle/turtlebot3_waffle_pi.xml`: robot geometry,
-  joints, actuators and sensor definitions; `assets/` holds its meshes.
-- `track_a_mobile_robot/main.py`: configures the model and runs shared sensing,
-  perception and EKF updates in viewer/headless modes, with terminal reporting.
-- `track_a_mobile_robot/display.py`: live camera inset with marker annotations
-  and correction status, plus floor path/reference/LiDAR overlays.
-- `track_a_mobile_robot/sensing.py`: encoder and LiDAR readings, RGB capture
-  and camera calibration.
-- `track_a_mobile_robot/perception.py`: ArUco detection, configured landmark map,
-  camera-derived robot world poses/covariance and LiDAR frame transforms.
-- `scripts/perception_diagnostics.py`: offline perception evaluation and camera calibration.
-- `scripts/generate_marker.py`: regenerates both dock marker textures.
-- `track_a_mobile_robot/state_model.py`: wheel geometry, midpoint pose prediction
-  and its Jacobians for covariance propagation.
-- `track_a_mobile_robot/estimation.py`: `PoseEstimator.predict()` / `correct()` and
-  `StateEstimate` snapshots containing timestamp, world pose and covariance.
-- `track_a_mobile_robot/evaluation.py`: simulator truth and pose-error calculations,
-  used only for reporting results.
-- `track_a_mobile_robot/navigation.py`: LiDAR waypoint planning, trajectory references
-  and approach/alignment/docking stages.
-- `track_a_mobile_robot/control.py`: LQI tracking, heading feedback for alignment
-  and conversion to wheel speeds.
-- `tests/test_navigation.py`: planning, observation-loss, docking and tracking checks.
-
-The estimator accepts `correct(camera_pose_world, camera_covariance, time)`
-with a positive-definite 3×3 covariance in metres/metres/radians order. It rejects
-mismatched timestamps and repeated frames. Range and bearing remain available
-for diagnostics, but the chosen EKF interface uses the full world-pose observation.
+- `main.py`: simulation construction, sensor loop and pipeline connections.
+- `perception.py`: marker detection and relative dock measurements.
+- `estimation.py`: encoder odometry and joint local robot/dock EKF.
+- `navigation.py`: exploration, boundary following, trajectory generation and safety checks.
+- `control.py`: LQI tracking, direct PBVS alignment/docking and wheel conversion.
+- `display.py`: camera inset and local sensor map.
+- `state_model.py`: differential-drive motion and Jacobians.
 
 ## Model source
 

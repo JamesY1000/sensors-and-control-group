@@ -12,7 +12,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Match the black-square / panel ratios in world/charging_station.xml:
-    # ID 0: 0.20 m marker on a 0.28 m panel (300 + 2 * 60 pixels).
+    # ID 0: 0.40 m marker on a 0.56 m panel (300 + 2 * 60 pixels).
     # ID 1: 0.04 m marker on a 0.06 m panel (400 + 2 * 100 pixels).
     for marker_id, marker_pixels, margin_pixels in ((0, 300, 60), (1, 400, 100)):
         marker = cv2.aruco.generateImageMarker(dictionary, marker_id, marker_pixels)

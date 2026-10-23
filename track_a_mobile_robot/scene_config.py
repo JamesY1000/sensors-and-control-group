@@ -71,12 +71,10 @@ class LidarConfig:
 
 @dataclass(frozen=True)
 class EstimationConfig:
-    """Store the update rate, noise seed and initial uncertainty assumptions."""
+    """Store the update rate, noise seed and process uncertainty assumptions."""
 
     update_hz: float
     noise_seed: int
-    initial_position_std_m: float
-    initial_heading_std_deg: float
     process_position_std_m_per_sqrt_s: float
     process_heading_std_deg_per_sqrt_s: float
 
@@ -85,9 +83,6 @@ class EstimationConfig:
             raise ValueError("estimation.update_hz must be positive")
         if isinstance(self.noise_seed, bool) or not isinstance(self.noise_seed, int) or self.noise_seed < 0:
             raise ValueError("estimation.noise_seed must be a non-negative integer")
-        for name in ("initial_position_std_m", "initial_heading_std_deg"):
-            if _number(getattr(self, name), f"estimation.{name}") <= 0:
-                raise ValueError(f"estimation.{name} must be positive")
         for name in ("process_position_std_m_per_sqrt_s", "process_heading_std_deg_per_sqrt_s"):
             if _number(getattr(self, name), f"estimation.{name}") < 0:
                 raise ValueError(f"estimation.{name} must be non-negative")
@@ -95,35 +90,44 @@ class EstimationConfig:
 
 @dataclass(frozen=True)
 class NavigationConfig:
-    """Store dock offsets, trajectory limits and observation requirements."""
+    """Store dock offsets, tracking limits and observation requirements."""
 
+    coarse_distance_m: float
+    coarse_tolerance_m: float
+    pbvs_speed_mps: float
     approach_distance_m: float
     dock_distance_m: float
     drive_speed_mps: float
     dock_speed_mps: float
     turn_speed_rad_s: float
-    acceleration_mps2: float
     clearance_m: float
-    grid_resolution_m: float
     position_tolerance_m: float
     heading_tolerance_deg: float
-    camera_timeout_s: float
     lidar_timeout_s: float
-    camera_confirmations: int
-    reference_lead_m: float
+    search_spin_s: float
+    search_drive_s: float
+    progress_timeout_s: float
+    boundary_join_gap_m: float
+    detour_step_m: float
+    detour_speed_mps: float
+    detour_timeout_s: float
 
     def __post_init__(self) -> None:
         for field in fields(self):
             if _number(getattr(self, field.name), f"navigation.{field.name}") <= 0:
                 raise ValueError(f"navigation.{field.name} must be positive")
-        if not isinstance(self.camera_confirmations, int):
-            raise ValueError("navigation.camera_confirmations must be an integer")
+        if self.coarse_distance_m <= self.approach_distance_m:
+            raise ValueError("Coarse distance must exceed PBVS approach distance")
+        if self.pbvs_speed_mps > self.drive_speed_mps:
+            raise ValueError("PBVS approach speed must not exceed driving speed")
         if self.approach_distance_m <= self.dock_distance_m:
             raise ValueError("Approach distance must exceed docking distance")
         if self.dock_speed_mps > self.drive_speed_mps:
             raise ValueError("Docking speed must not exceed approach speed")
         if self.heading_tolerance_deg >= 90:
             raise ValueError("Heading tolerance must be less than 90 degrees")
+        if self.detour_speed_mps > self.drive_speed_mps:
+            raise ValueError("Detour speed must not exceed approach speed")
 
 
 @dataclass(frozen=True)
@@ -170,7 +174,7 @@ def load_config(path: str | Path = DEFAULT_CONFIG) -> SceneConfig:
         camera = _section(values, "camera", {"position_m", "rpy_deg", "fov_y_deg"})
         lidar = _section(values, "lidar", {"position_m", "yaw_deg"})
         estimation = _section(values, "estimation", {
-            "update_hz", "noise_seed", "initial_position_std_m", "initial_heading_std_deg",
+            "update_hz", "noise_seed",
             "process_position_std_m_per_sqrt_s", "process_heading_std_deg_per_sqrt_s",
         })
         fov_y_deg = _number(camera["fov_y_deg"], "camera.fov_y_deg")

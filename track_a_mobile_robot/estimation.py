@@ -1,25 +1,36 @@
 """
-Our estimator should essentially maintain the estimated pose and its covariance (x_hat = [x_hat, y_hat, theta_hat].T, and P)
+Our estimator should essentially maintain the estimated robot and dock poses,
+and their joint covariance, in a fixed local odometry frame.
+
+It stores:
+- Joint state x_hat = [robot x, robot y, robot heading, dock x, dock y, dock heading].T
+- Joint covariance P (6 x 6), including uncertainty shared between robot and dock
 
 Currently its inputs are:
 - Wheel encoder readings (from sensing)
-- Derived robot pose from aruco marker detections when available (via RGB camera) (from perception)
+- Derived dock pose in the current robot frame and its covariance (from perception)
 
-It has 2 stages:
-- Prediction:
-    - Computes wheel angle increments from successive wheel encoder readings
-    - Uses the diff-drive model and previous estimated pose to predict the current pose (dead reckoning)
-    - Propagate the covariance to account for encoder and motion-model uncertainty
-- Correction:
-    - Correct the predicted robot pose and covariance using valid and fresh robot pose derived from detected aruco markers (using the RGB camera)
-    - Reject camera innovations inconsistent with prediction and measurement uncertainty
-    
-The correction stage will only occur if there are valid and fresh aruco marker derived robot poses, otherwise the output estimated 
-robot pose will just be the predicted pose using wheel encoders.
+It has 3 stages:
+1. Initialisation:
+   - Wait for the first usable ArUco pose before starting local odometry
+   - Define the robot pose as (0, 0, 0) and use current encoders as the baseline
+   - Initialise the unknown dock from the camera measurement and its uncertainty
+2. Prediction:
+   - Compute wheel angle increments from successive encoder readings
+   - Use the diff-drive model to predict the robot pose; the dock is stationary
+   - Propagate the joint covariance to account for motion and encoder uncertainty
+3. Correction:
+   - Compare the measured robot-relative dock pose with the predicted measurement
+   - Reject observations that are inconsistent with the predicted uncertainty
+   - Correct both poses and their covariance using accepted camera measurements
 
-It ouputs:
-- A fused estimated robot pose as a StateEstimate object (time, pose, covariance)
+Without a fresh usable camera pose, the estimate continues from prediction only.
+Before acquisition, no odometry is accumulated and dock pose is None.
 
+It outputs:
+- A StateEstimate object (time, robot pose/covariance, dock pose/covariance)
+
+Neither the robot's starting world pose nor the dock's world pose is an input.
 """
 
 from dataclasses import dataclass
@@ -30,186 +41,188 @@ from .sensing import WheelEncoderReading
 from .state_model import DifferentialDriveModel, wrap_angle
 
 
-# 99% chi-squared threshold for a three-component pose innovation.
-CAMERA_INNOVATION_LIMIT = 11.345
+CAMERA_INNOVATION_LIMIT = 11.345 # 99% chi-squared threshold, three components
 
 
 @dataclass(frozen=True)
 class StateEstimate:
-    """
-    Store the state estimate (pose and uncertainty) at a simulation snapshot.
-    Store time, robot pose (in the world frame), covariance
+    """Store a snapshot for navigation and control, separate from the EKF's working state.
+
+    Before acquisition, pose_local is only the current robot-frame identity.
+    After acquisition, both poses use the fixed local frame defined at that instant.
     """
 
     time: float
-    pose_world: tuple[float, float, float]
+    pose_local: tuple[float, float, float]
     covariance: np.ndarray
+    dock_pose_local: tuple[float, float, float] | None = None
+    dock_covariance: np.ndarray | None = None
+
+    @property
+    def dock_pose_base(self) -> tuple[float, float, float] | None:
+        """Return the estimated dock pose relative to the current robot for PBVS."""
+        if self.dock_pose_local is None:
+            return None
+        # Both poses share the same local frame. Removing the robot transform gives
+        # the relative pose, using the fused estimate rather than a raw camera frame.
+        pose, _ = relative_dock_model(np.r_[self.pose_local, self.dock_pose_local])
+        return tuple(pose)
 
     def __post_init__(self) -> None:
-        # Give this result its own array so later filter updates cannot alter it.
-        covariance = np.array(self.covariance, dtype=float, copy=True)
-        covariance.setflags(write=False)
-        # Assign the protected copy during construction of this frozen dataclass.
-        object.__setattr__(self, "covariance", covariance)
+        # Copy and protect the arrays so later EKF updates cannot change this result.
+        for name in ('covariance', 'dock_covariance'):
+            value = getattr(self, name)
+            if value is not None:
+                value = np.array(value, dtype=float, copy=True)
+                value.setflags(write=False)
+                object.__setattr__(self, name, value)
+
+
+def relative_dock_model(state: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Predict dock pose in the robot frame and its Jacobian for the joint state."""
+    x, y, heading, dx, dy, dock_heading = state
+    # Subtract robot position, then rotate from local odometry into the robot frame.
+    # This predicts what the camera should measure from our current joint estimate.
+    c, s = np.cos(heading), np.sin(heading)
+    rotation = np.array([[c, s], [-s, c]])
+    relative_xy = rotation @ np.array([dx - x, dy - y])
+    measurement = np.r_[relative_xy, wrap_angle(dock_heading - heading)]
+    # H (3 x 6) describes how each state component affects the relative measurement.
+    # Changing robot heading rotates the relative XY position as well as its heading.
+    H = np.zeros((3, 6))
+    H[:2, :2] = -rotation
+    H[:2, 2] = [relative_xy[1], -relative_xy[0]]
+    H[:2, 3:5] = rotation
+    H[2, 2], H[2, 5] = -1.0, 1.0
+    return measurement, H
+
 
 class PoseEstimator:
-    """
-    Extended Kalman Filter fuses encoder data (used in the prediction step) with
-    aruco marker detections (correction step).
-    """
-    
-    # initialise with the drive model, initial pose and covariance, and noise settings
-    def __init__(
-        self,
-        model: DifferentialDriveModel,
-        initial_pose: tuple[float, float, float],
-        initial_covariance: np.ndarray,
-        encoder_noise_std_rad: tuple[float, float],
-        process_noise_covariance_per_s: np.ndarray,
-    ) -> None:
+    """EKF for encoder motion and camera observations of one unknown rigid dock."""
 
-        self._model = model # Motion model used for prediction and its Jacobians
-        self._pose = np.array(initial_pose, dtype=float, copy=True) # Current estimated pose
-        self._pose[2] = wrap_angle(self._pose[2]) # Normalise heading to -pi, pi
-        self._P = np.array(initial_covariance, dtype=float, copy=True) # Current uncertainty
-        self._encoder_noise_std_rad = np.array(encoder_noise_std_rad, dtype=float, copy=True)
-        self._process_noise_covariance_per_s = np.array(process_noise_covariance_per_s, dtype=float, copy=True)
-        
-        # Set empty first/previous encoder reading until the first one arrives
+    def __init__(self, model: DifferentialDriveModel, encoder_noise_std_rad,
+                 process_noise_covariance_per_s: np.ndarray) -> None:
+        # Store the motion model and noise assumptions used in prediction.
+        self._model = model
+        self._encoder_noise_std_rad = np.asarray(encoder_noise_std_rad, dtype=float)
+        self._process_noise_covariance_per_s = np.array(process_noise_covariance_per_s, copy=True)
+        # The first three states belong to the robot; the last three belong to the dock.
+        # P's diagonal 3 x 3 blocks store each pose covariance. Its off-diagonal
+        # blocks store their cross-covariance (how their estimation errors are related).
+        self._state = np.zeros(6)
+        self._P = np.zeros((6, 6))
         self._previous_encoders: WheelEncoderReading | None = None
-        
-        # Same for camera timestamp
         self._last_camera_time: float | None = None
+        # Odometry and the joint dock state both start at the first accepted marker.
+        self.initialised = False
         self.camera_correction_accepted = False
-    
-        
-        
 
-    # Predict using encoders
-    def predict(
-        self, 
-        encoders: WheelEncoderReading
-    ) -> StateEstimate:
-        """
-        Use wheel encoder readings to predict new robot pose and covariance from current estimate
-        """
-        
-        # Set the previous encoder reading
-        self.camera_correction_accepted = False
-        previous_encoders = self._previous_encoders
-        
-        if previous_encoders is not None:
-            
-            # Get 
-            dt = encoders.time - previous_encoders.time
-            
-            if dt <= 0:
-                raise ValueError("Encoder timetamps must increase")
-            
-            # Get the change in encoders in rads since last reading
-            delta_left = encoders.left_encoder_rad - previous_encoders.left_encoder_rad
-            delta_right = encoders.right_encoder_rad - previous_encoders.right_encoder_rad
-            
-            # Get the Jacobians F and G at previous pose estimate
-            F, G = self._model.motion_jacobians(self._pose, delta_left, delta_right)
-            
-            # Predict new robot pose
-            self._pose = self._model.predict_pose(self._pose, delta_left, delta_right)
-            
-            # Compute covariance of wheel increments
-            # Each wheel increment subtracts two independent noisy angle readings,
-            # so its variance is sigma^2 + sigma^2 = 2*sigma^2
-            wheel_increment_covariance = np.diag(2.0 * self._encoder_noise_std_rad **2)
-            
-            # Propagate existing uncertainty and add the motion uncertainty
-            # Should be previous uncertainty + encoder uncertainty + additional model uncertainty 
-            # So P_k = F*P_k-1*F.T + G*(wheel covariance)*G.T + Q_rate*dT
-            self._P = (F @ self._P @ F.T + G @ wheel_increment_covariance @ G.T + self._process_noise_covariance_per_s * dt)
-            
-            # Remove small numerical asymmetry from floating-point arithmetic.
-            self._P = 0.5 * (self._P + self._P.T)
-            
-        # Upate previous encoder readings with current readings
+    def _estimate(self, time: float) -> StateEstimate:
+        # Return each pose's covariance, retaining the full joint P inside the EKF.
+        # A missing dock pose tells navigation to continue exploration.
+        return StateEstimate(time, tuple(self._state[:3]), self._P[:3, :3],
+                             tuple(self._state[3:]) if self.initialised else None,
+                             self._P[3:, 3:] if self.initialised else None)
+
+    @staticmethod
+    def _measurement(pose, covariance):
+        # z = [dock x, dock y, dock heading] in the current robot frame.
+        # R describes measurement uncertainty in those same coordinates.
+        z, R = np.asarray(pose, dtype=float), np.asarray(covariance, dtype=float)
+        if z.shape != (3,) or R.shape != (3, 3) or not np.isfinite(z).all() or not np.isfinite(R).all():
+            raise ValueError('Expected a finite relative pose and 3x3 covariance')
+        if not np.allclose(R, R.T) or np.min(np.linalg.eigvalsh(R)) <= 0:
+            raise ValueError('Camera covariance must be symmetric positive definite')
+        return z, R
+
+    def initialise_dock(self, encoders: WheelEncoderReading, dock_pose_base,
+                        camera_covariance) -> StateEstimate:
+        """Start the local frame at the first accepted marker, excluding earlier travel."""
+        if self.initialised:
+            raise ValueError('Dock is already initialised; correct subsequent observations')
+        z, R = self._measurement(dock_pose_base, camera_covariance)
+        # At acquisition the robot defines (0, 0, 0). Its frame and the new local
+        # frame coincide, so the measured relative dock pose needs no transformation.
+        self._state[:] = 0.
+        self._state[3:] = z
+        self._state[5] = wrap_angle(z[2])
+        # Zero robot covariance defines this local origin, not a known world pose.
+        # The unknown dock starts with camera uncertainty; cross-covariance grows
+        # through subsequent encoder predictions and camera corrections.
+        self._P[:] = 0.
+        self._P[3:, 3:] = R
         self._previous_encoders = encoders
-        
-        # Pass a pose tuple to StateEstimate
-        pose_world = tuple(float(value) for value in self._pose)
-        
-        return StateEstimate(
-            time=encoders.time,
-            pose_world=pose_world,
-            covariance=self._P
-        )
+        self._last_camera_time = encoders.time
+        self.initialised = self.camera_correction_accepted = True
+        return self._estimate(encoders.time)
 
-    # Correct using camera
-    def correct(
-        self, 
-        camera_pose: tuple[float, float, float], 
-        camera_covariance: np.ndarray, 
-        time: float
-    )-> StateEstimate:
-        """
-        Use camera aruco marker detections to correct predicted pose when available
-        """
-        
-        # Check there is already a prediction at current image timestamp
-        if self._previous_encoders is None:
-            raise ValueError("Prediction using encoders must complete first")
-        
-        # Check that the camera timestamp is close to the encoder timestamp
-        if not np.isclose(time, self._previous_encoders.time, rtol=0.0, atol=1e-9):
-            raise ValueError("Camera and encoder timestamps must be in sync to perform correction")
-        
-        # Only use new or unused camera measurements
-        if self._last_camera_time is not None:
-            if time <= self._last_camera_time:
-                raise ValueError("Camera measurement has already been used or is older")
-        
-        # Camera derived robot pose and measurement covariance
-        z = np.asarray(camera_pose, dtype=float)
-        R = np.asarray(camera_covariance, dtype=float)
-        
-        # Check that the received pose and covariance are the correct shape
-        if z.shape != (3,) or R.shape != (3, 3):
-            raise ValueError("Expected a 3-element pose and a 3x3 pose covariance")
-        if not np.isfinite(z).all() or not np.isfinite(R).all():
-            raise ValueError("Camera pose and covariance must be finite")
-        
-        # Compute pose innovation (measured - predicted pose)
-        innovation = z - self._pose
-        innovation[2] = wrap_angle(innovation[2]) # Normalise angle
-        
-        # Innovation covariance and Kalman Gain
-        S = self._P + R
-        # Compare the discrepancy with combined prediction/measurement uncertainty.
-        # Consume rejected frames too; navigation must not count them as confirmations.
+    def predict(self, encoders: WheelEncoderReading) -> StateEstimate:
+        """Predict with wheel increments only after the first accepted marker."""
+        self.camera_correction_accepted = False
+        if not self.initialised:
+            # Exploration sends timed commands; do not integrate or store its travel.
+            return self._estimate(encoders.time)
+        previous = self._previous_encoders
+        dt = encoders.time - previous.time
+        if dt <= 0:
+            raise ValueError('Encoder timestamps must increase')
+        # Compute wheel angle increments since the previous prediction.
+        delta_left = encoders.left_encoder_rad - previous.left_encoder_rad
+        delta_right = encoders.right_encoder_rad - previous.right_encoder_rad
+        # F (3 x 3) maps previous robot-pose uncertainty into the next pose.
+        # G (3 x 2) maps wheel-increment uncertainty into robot-pose uncertainty.
+        # Evaluate both at the previous pose, then predict the new robot pose.
+        F, G = self._model.motion_jacobians(self._state[:3], delta_left, delta_right)
+        self._state[:3] = self._model.predict_pose(self._state[:3], delta_left, delta_right)
+        # Extend F to the joint state. The stationary dock keeps its identity block.
+        joint_F = np.eye(6)
+        joint_F[:3, :3] = F
+        # Each increment subtracts two readings. Assuming independent reading noise,
+        # its variance is sigma^2 + sigma^2 = 2 * sigma^2 for each wheel.
+        wheel_covariance = np.diag(2.0 * self._encoder_noise_std_rad**2)
+        # P_pred = F_joint @ P @ F_joint.T + Q_joint
+        # Propagate all blocks, including cross-covariance; add motion noise to robot only.
+        self._P = joint_F @ self._P @ joint_F.T
+        self._P[:3, :3] += G @ wheel_covariance @ G.T + self._process_noise_covariance_per_s * dt
+        # Remove small numerical asymmetry from floating-point calculations.
+        self._P = .5 * (self._P + self._P.T)
+        self._previous_encoders = encoders
+        return self._estimate(encoders.time)
+
+    def correct(self, dock_pose_base, camera_covariance, time: float) -> StateEstimate:
+        """Fuse a relative dock pose, retaining robot/dock uncertainty and correlation."""
+        if not self.initialised or self._previous_encoders is None:
+            raise ValueError('Initialise the dock before correction')
+        # Fuse each frame once, at the encoder prediction time it belongs to.
+        if not np.isclose(time, self._previous_encoders.time, rtol=0, atol=1e-9):
+            raise ValueError('Camera and encoder timestamps must be in sync')
+        if time <= self._last_camera_time:
+            raise ValueError('Camera measurement has already been used or is older')
+        z, R = self._measurement(dock_pose_base, camera_covariance)
+        # Innovation = measured relative dock pose - predicted relative dock pose.
+        # Wrap the heading difference so crossing +/-pi does not create a large error.
+        predicted, H = relative_dock_model(self._state)
+        innovation = z - predicted
+        innovation[2] = wrap_angle(innovation[2])
+        # S is innovation covariance: predicted measurement uncertainty plus camera noise.
+        S = H @ self._P @ H.T + R
+        # Mark even rejected frames as consumed so they cannot be retried as new data.
         self._last_camera_time = time
         self.camera_correction_accepted = False
-        innovation_distance = float(innovation @ np.linalg.solve(S, innovation))
-        if innovation_distance > CAMERA_INNOVATION_LIMIT:
-            return StateEstimate(time, tuple(float(value) for value in self._pose), self._P)
-        K = np.linalg.solve(S.T, self._P.T).T
-        
-        # Correct the estimated pose
-        # x_hat = x_hat_prev + K*(z - x_hat_prev) or x_hat = x_hat_prev + K*innovation
-        self._pose = self._pose + K @ innovation # x_hat is new or corrected pose
-        self._pose[2] = wrap_angle(self._pose[2])
-        
-        # Use Joseph form here to update covariance, let H = I
-        # P = (I-K*H)*P_prev*(I-K*H).T + K*R*K.T
-        I_minus_K = np.eye(3) - K
-        self._P = (I_minus_K @ self._P @ I_minus_K.T + K @ R @ K.T)
-        
-        # Remove small floating-point asymmetry.
-        self._P = 0.5 * (self._P + self._P.T)
-        
-        # Tell the caller this measurement was accepted, so navigation can use it.
+        # Gate using the normalised innovation, not a fixed distance/angle threshold.
+        # A large disagreement relative to S leaves the predicted state and P unchanged.
+        if float(innovation @ np.linalg.solve(S, innovation)) > CAMERA_INNOVATION_LIMIT:
+            return self._estimate(time)
+        # Kalman gain K = P @ H.T @ inv(S), computed with a solve instead of an inverse.
+        # Shared uncertainty allows this relative observation to update robot and dock.
+        K = np.linalg.solve(S, H @ self._P).T
+        self._state += K @ innovation
+        self._state[2] = wrap_angle(self._state[2])
+        self._state[5] = wrap_angle(self._state[5])
+        # Joseph covariance update keeps the two uncertainty contributions explicit:
+        # P = (I - K H) @ P @ (I - K H).T + K @ R @ K.T
+        I_minus_KH = np.eye(6) - K @ H
+        self._P = I_minus_KH @ self._P @ I_minus_KH.T + K @ R @ K.T
+        self._P = .5 * (self._P + self._P.T)
         self.camera_correction_accepted = True
-        
-        pose_world=tuple(float(value) for value in self._pose)
-        
-        return StateEstimate(
-            time=time,
-            pose_world=pose_world,
-            covariance=self._P
-        )
+        return self._estimate(time)
