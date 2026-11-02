@@ -1,5 +1,5 @@
 """
-Our main file connects the sensor-only docking pipeline.
+Our main file runs the autonomous docking simulation.
 
 1. Build the simulation using YAML spawn poses and sensor settings. Spawn poses
    only place physical objects; they are not passed to robot algorithms.
@@ -9,7 +9,7 @@ Our main file connects the sensor-only docking pipeline.
 
 The GUI shows camera/map panels and a robot-relative 3D preview. Only display
 code uses the simulator robot pose to position drawings in the viewer world.
-Use --navigate for autonomous exploration and docking; otherwise wheels stay stopped.
+Exploration and docking start automatically when the simulation launches.
 """
 
 import argparse
@@ -169,7 +169,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the TurtleBot estimation and docking demo.")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--headless", action="store_true", help="Run without a viewer.")
-    parser.add_argument("--navigate", action="store_true", help="Enable autonomous approach and docking.")
     parser.add_argument("--verbose", action="store_true", help="Include estimated pose, uncertainty and camera counts in logs.")
     parser.add_argument(
         "--seconds", type=float,
@@ -202,13 +201,12 @@ def main() -> None:
 
         viewer_context = viewer.launch_passive(model, data)
 
-    mode = "autonomous docking" if args.navigate else "stationary sensor demo"
-    print(f"Sensing and EKF: {config.estimation.update_hz:g} Hz; {mode}.", flush=True)
+    print(f"Sensing and EKF: {config.estimation.update_hz:g} Hz; autonomous docking.", flush=True)
     print("Odometry starts at marker acquisition. Logs: camera age and simulation speed; --verbose adds pose diagnostics.", flush=True)
     with viewer_context as window:
         # Create these once so each update uses the previous estimate and sensor history.
         estimator, perception, encoder_rng = create_demo(model, config.estimation)
-        navigator = Navigator(config.navigation) if args.navigate else None
+        navigator = Navigator(config.navigation)
         controller = MotionController(config.navigation)
         wheel_ids = [model.actuator(name).id for name in ("wheel_left", "wheel_right")]
         wheel_commands = (0.0, 0.0)
@@ -233,7 +231,7 @@ def main() -> None:
                 if now < last_physics_time:
                     perception.close()
                     estimator, perception, encoder_rng = create_demo(model, config.estimation)
-                    navigator = Navigator(config.navigation) if args.navigate else None
+                    navigator = Navigator(config.navigation)
                     controller.reset()
                     wheel_commands = (0.0, 0.0)
                     if display is not None:
@@ -264,16 +262,15 @@ def main() -> None:
 
                     # LQI tracks coarse/detour references. PBVS then commands
                     # velocities from the EKF's relative dock pose, without a reference.
-                    if navigator is not None:
-                        request = navigator.motion_request(estimate, output)
-                        command = controller.compute_velocity_command(estimate, request)
-                        # Check the actual commanded arc against the latest LiDAR.
-                        # Navigation chooses detours; this final check can still stop them.
-                        allowed = navigator.allow_motion(request, command.v_mps, command.omega_rad_s, output)
-                        if not allowed:
-                            controller.reset()
-                            command = VelocityCommand(estimate.time, 0.0, 0.0)
-                        wheel_commands = velocity_command_to_wheel_speeds(command)
+                    request = navigator.motion_request(estimate, output)
+                    command = controller.compute_velocity_command(estimate, request)
+                    # Check the actual commanded arc against the latest LiDAR.
+                    # Navigation chooses detours; this final check can still stop them.
+                    allowed = navigator.allow_motion(request, command.v_mps, command.omega_rad_s, output)
+                    if not allowed:
+                        controller.reset()
+                        command = VelocityCommand(estimate.time, 0.0, 0.0)
+                    wheel_commands = velocity_command_to_wheel_speeds(command)
 
                     # Display the same camera image used by perception, with its detections.
                     if window is not None:
@@ -281,9 +278,9 @@ def main() -> None:
 
                     # Report every two seconds, plus phase/stop changes. Changing
                     # PBVS error values must not cause a new line on every update.
-                    phase = navigator.phase if navigator else 'SENSORS'
-                    status = navigator.status if navigator else 'Wheels stopped'
-                    stopped = navigator is not None and (request.stop_requested or not allowed)
+                    phase = navigator.phase
+                    status = navigator.status
+                    stopped = request.stop_requested or not allowed
                     event = (phase, status if stopped else '')
                     if now >= next_report_time or event != last_report_event:
                         speed = (now - sim_origin) / max(time.perf_counter() - wall_origin, 1e-9)

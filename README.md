@@ -13,10 +13,10 @@ Use Python 3.12 or newer from the repository root:
 python3 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install -r requirements.txt
-python3 -m track_a_mobile_robot.main --navigate
+python3 -m track_a_mobile_robot.main
 ```
 
-Without `--navigate`, the wheels remain stopped for sensor checks. Optional
+The exploration and docking demo starts automatically on launch. Optional
 `--config config/simulation_config.yml` selects the configuration. Use
 `--headless --seconds 5` for a bounded run without a GUI. Headless defaults to
 two simulated seconds; GUI runs continue until closed unless `--seconds` is set.
@@ -313,7 +313,7 @@ The circle shows `clearance_m`, which may differ from the physical chassis outli
 The top-left GUI overlay has two lines: phase/time and status. The terminal prints
 a compact status every two simulated seconds, plus phase/stop changes, with the
 age of the last accepted camera pose and simulation speed (`1.00x` is real time).
-Use `python3 -m track_a_mobile_robot.main --navigate --verbose` to include the
+Use `python3 -m track_a_mobile_robot.main --verbose` to include the
 estimated pose, one-standard-deviation uncertainty and accepted/total camera counts.
 Initial zero robot covariance defines the local frame; uncertainty then grows with
 encoder motion after marker acquisition. Before then, the displayed identity is
