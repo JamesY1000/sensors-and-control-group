@@ -52,6 +52,13 @@ navigation:
   # Tolerance is distance to that point, not distance to the dock itself.
   coarse_distance_m: 1.5
   coarse_tolerance_m: 0.25
+  # Reacquire first faces the dock and confirms recent accepted camera poses.
+  reacquire_heading_tolerance_deg: 10.0
+  reacquire_observation_age_s: 0.5
+  reacquire_confirmations: 3
+  reacquire_wait_s: 1.0
+  reacquire_sweep_deg: 30.0
+  reacquire_timeout_s: 30.0
   # PBVS then reaches/aligns at approach_distance_m before final docking.
   pbvs_speed_mps: 0.15
   approach_distance_m: 0.7 # Set it quite far away
@@ -64,7 +71,7 @@ navigation:
   clearance_m: 0.25
   position_tolerance_m: 0.03
   heading_tolerance_deg: 3.0
-  # Continue on encoder prediction after acquisition; no marker-loss timeout.
+  # Travel uses encoder prediction during marker loss; REACQUIRE gates PBVS entry.
   lidar_timeout_s: 0.5
   # Timed commands before marker acquisition; actual angle/distance are not measured.
   search_spin_s: 20.0

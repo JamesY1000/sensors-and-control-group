@@ -47,6 +47,13 @@ def navigation_settings():
                    approach_distance_m=.5, dock_distance_m=.3, clearance_m=.27)
 
 
+def confirm_at_coarse(nav):
+    """Enter PBVS through the real confirmation gate before testing later phases."""
+    for time in (-.06, -.04, -.02):
+        nav.motion_request(state(time, (.5, 0, 0)), observations(time, (.5, 0, 0)))
+    assert nav.phase == 'ALIGN'
+
+
 class NavigationTests(unittest.TestCase):
     def setUp(self):
         self.settings = navigation_settings()
@@ -121,31 +128,31 @@ class NavigationTests(unittest.TestCase):
         np.testing.assert_allclose(self.nav.approach_pose, [3, 4.5, -math.pi / 2])
         np.testing.assert_allclose(self.nav.docking_pose, [3, 4.3, -math.pi / 2])
 
-    def test_stored_estimate_allows_handover_at_coarse_offset(self):
+    def test_stored_estimate_starts_reacquisition_at_coarse_offset(self):
         request = self.step(0, (.5, 0, 0), camera=False)
-        self.assertEqual(self.nav.phase, 'ALIGN')
-        self.assertEqual(request.dock_offset_m, .5)
-        self.assertEqual(request.speed_limit_mps, self.settings.pbvs_speed_mps)
+        self.assertEqual(self.nav.phase, 'REACQUIRE')
+        self.assertFalse(request.visual_servo)
+        self.assertEqual(request.speed_limit_mps, 0.)
 
     def test_marker_loss_never_times_out_in_any_travel_phase(self):
         for pose, mode in (((0,0,0), 'APPROACH'), ((1.2,0,0), 'ALIGN'), ((1.5,0,0), 'DOCK')):
             self.nav = Navigator(self.settings)
             if mode != 'APPROACH':
-                self.step(-.02, (.5,0,0))
+                confirm_at_coarse(self.nav)
             self.step(0, pose)
             for time in (.7, 21., 300., 10000.):
                 request = self.step(time, pose, camera=False)
                 self.assertEqual(request.mode, mode)
                 self.assertFalse(request.stop_requested)
 
-    def test_prediction_can_start_pbvs_without_fresh_camera(self):
+    def test_prediction_cannot_start_pbvs_without_fresh_camera(self):
         self.step(0, (0,0,0))
         request = self.step(300, (.5,0,0), camera=False)
-        self.assertEqual(request.mode, 'ALIGN')
-        self.assertTrue(request.visual_servo)
+        self.assertEqual(request.mode, 'REACQUIRE')
+        self.assertFalse(request.visual_servo)
 
     def test_both_final_position_and_heading_required(self):
-        self.step(-.02, (.5,0,0))
+        confirm_at_coarse(self.nav)
         for t in (0, .02, .04):
             self.step(t, (1.5, 0, 0))
         self.assertTrue(self.step(.06, (1.6, .02, 0)).visual_servo)
@@ -204,7 +211,10 @@ class NavigationTests(unittest.TestCase):
 
     def test_invalid_time_settings_and_request_are_rejected(self):
         for changes in ({'clearance_m': -1}, {'search_spin_s': True},
-                        {'lidar_timeout_s': 0}, {'dock_distance_m': .6}):
+                        {'lidar_timeout_s': 0}, {'dock_distance_m': .6},
+                        {'reacquire_confirmations': 1}, {'reacquire_confirmations': 2.5},
+                        {'reacquire_heading_tolerance_deg': 90}, {'reacquire_sweep_deg': 180},
+                        {'reacquire_timeout_s': .5}):
             with self.assertRaises(ValueError):
                 replace(self.settings, **changes)
         with self.assertRaises(ValueError):
@@ -306,7 +316,7 @@ class AvoidanceTests(unittest.TestCase):
         self.assertEqual(nav.motion_request(state(52, (.2, 0, 0)),
             observations(52, (.2, 0, 0), obstacles=[(.7, 0)], camera=False)).mode, 'STOP')
         nav = Navigator(self.settings)
-        nav.motion_request(state(-.02, (.5,0,0)), observations(-.02, (.5,0,0)))
+        confirm_at_coarse(nav)
         for t in (0, .02, .04):
             request = nav.motion_request(state(t, (1.5, 0, 0)), observations(t, (1.5, 0, 0)))
         self.assertEqual(nav.phase, 'DOCK')
@@ -335,7 +345,7 @@ class AvoidanceTests(unittest.TestCase):
 
     def test_alignment_and_final_handover_continue_during_occlusion(self):
         nav = Navigator(self.settings)
-        nav.motion_request(state(-.02, (.5,0,0)), observations(-.02, (.5,0,0)))
+        confirm_at_coarse(nav)
         pose = (1.5,0,.4)
         nav.motion_request(state(0, pose), observations(0, pose))
         request = nav.motion_request(state(300, pose), observations(300, pose, camera=False))
@@ -571,17 +581,22 @@ class PBVSTests(unittest.TestCase):
         self.settings = navigation_settings()
         self.controller = MotionController(self.settings)
 
-    def test_handover_ignores_heading_and_discards_trajectory(self):
+    def test_handover_faces_dock_before_pbvs_discards_trajectory(self):
         nav = Navigator(self.settings)
         pose = (.4, .15, .7)
         for t in (0, .02, .04):
             request = nav.motion_request(state(t, pose), observations(t, pose))
+        self.assertEqual(request.mode, 'REACQUIRE')
+        self.assertEqual(request.reference.kind, 'TURN')
+        command = self.controller.compute_velocity_command(state(.04, pose), request)
+        self.assertEqual(command.v_mps, 0.)
+        self.assertLess(command.omega_rad_s, 0)
+        pose = (.4, .15, math.atan2(-.15, 1.6))
+        request = nav.motion_request(state(.06, pose), observations(.06, pose))
         self.assertEqual(request.mode, 'ALIGN')
         self.assertTrue(request.visual_servo)
         self.assertIsNone(request.reference)
         self.assertIsNone(nav.trajectory_preview)
-        command = self.controller.compute_velocity_command(state(.04, pose), request)
-        self.assertLess(command.omega_rad_s, 0)
 
     def test_side_and_too_close_arrivals_must_first_reach_coarse_offset(self):
         # All are within the old 1.75 m dock-centred region, but outside the
@@ -594,15 +609,15 @@ class PBVSTests(unittest.TestCase):
             np.testing.assert_allclose(nav.coarse_pose[:2], (.5,0.), atol=1e-12)
             reached = (.5,.24,1.2)
             request = nav.motion_request(state(1, reached), observations(1, reached))
-            self.assertEqual(request.mode, 'ALIGN')
-            self.assertIsNone(request.reference)
+            self.assertEqual(request.mode, 'REACQUIRE')
+            self.assertEqual(request.reference.kind, 'TURN')
 
     def test_stand_off_gate_follows_rotated_dock_normal(self):
         dock = (2.,3.,math.pi/2)
         # Dock normal is +Y, so the coarse target is (2, 4.5), not along world X.
         nav = Navigator(self.settings)
         for time, pose, expected in ((0., (3.,3.2,0.), 'APPROACH'),
-                                     (1., (2.2,4.5,-.7), 'ALIGN')):
+                                     (1., (2.2,4.5,-.7), 'REACQUIRE')):
             estimate = replace(state(time, pose), dock_pose_local=dock)
             request = nav.motion_request(estimate, observations(time, pose))
             self.assertEqual(request.mode, expected)
@@ -638,7 +653,7 @@ class PBVSTests(unittest.TestCase):
 
     def test_alignment_corrects_position_drift_without_camera_timeout(self):
         nav = Navigator(self.settings)
-        nav.motion_request(state(-.02, (.5,0,0)), observations(-.02, (.5,0,0)))
+        confirm_at_coarse(nav)
         for t in (0, .02, .04):
             nav.motion_request(state(t, (1.5, 0, .3)), observations(t, (1.5, 0, .3)))
         pose = (1.465, 0, 0)
@@ -689,6 +704,134 @@ class PBVSTests(unittest.TestCase):
                 omega = math.copysign(max(0., abs(command.omega_rad_s)-.24), command.omega_rad_s)
                 pose[2] = wrap_angle(pose[2] + .02*omega)
             self.assertLessEqual(abs(pose[2]), math.radians(self.settings.heading_tolerance_deg))
+
+
+class ReacquisitionTests(unittest.TestCase):
+    def setUp(self):
+        self.settings = navigation_settings()
+        self.nav = Navigator(self.settings)
+        self.controller = MotionController(self.settings)
+
+    def step(self, time, pose=(.5, 0, 0), **kwargs):
+        return self.nav.motion_request(state(time, pose), observations(time, pose, **kwargs))
+
+    def test_three_distinct_accepted_frames_required(self):
+        pose = (.5, 0, 0)
+        first = observations(0, pose)
+        self.assertEqual(self.nav.motion_request(state(0, pose), first).mode, 'REACQUIRE')
+        for time in (.02, .04):
+            # Repeated camera timestamps cannot masquerade as new evidence.
+            output = replace(observations(time, pose), dock_observation=first.dock_observation)
+            self.assertEqual(self.nav.motion_request(state(time, pose), output).mode, 'REACQUIRE')
+        self.assertEqual(self.step(.06).mode, 'REACQUIRE')
+        # Raw detections without an accepted pose do not count. Neither does a
+        # control tick with no new camera frame; it also preserves recent evidence.
+        rejected = replace(observations(.08, pose, camera=False), markers=[Mock()])
+        self.assertEqual(self.nav.motion_request(state(.08, pose), rejected).mode, 'REACQUIRE')
+        self.assertEqual(self.step(.10, fresh=False).mode, 'REACQUIRE')
+        self.assertEqual(self.step(.12).mode, 'ALIGN')
+
+    def test_recent_observations_allow_immediate_handover_without_new_frame(self):
+        for time in (0, .02, .04):
+            self.assertEqual(self.step(time, (.2, 0, 0)).mode, 'APPROACH')
+        request = self.step(.06, camera=False, fresh=False)
+        self.assertEqual(request.mode, 'ALIGN')
+        self.assertIsNone(request.reference)
+
+    def test_stale_and_future_observations_do_not_confirm_handover(self):
+        for time in (0, .02, .04):
+            self.step(time, (.2, 0, 0))
+        self.assertEqual(self.step(1, camera=False).mode, 'REACQUIRE')
+        pose = (.5, 0, 0)
+        for time, stamp in ((1.02, .04), (1.04, 2.)):
+            output = replace(observations(time, pose), dock_observation=observations(stamp, pose).dock_observation)
+            self.assertEqual(self.nav.motion_request(state(time, pose), output).mode, 'REACQUIRE')
+        self.assertEqual(self.step(1.06).mode, 'REACQUIRE')
+        self.assertEqual(self.step(1.08).mode, 'REACQUIRE')
+        self.assertEqual(self.step(1.10).mode, 'ALIGN')
+
+    def test_faces_dock_without_translation_before_pbvs(self):
+        # Include wheel friction to exercise the existing integral turn control.
+        for initial_heading in (-2.8, 2.8):
+            self.nav = Navigator(self.settings)
+            self.controller.reset()
+            pose = np.array([.5, 0., initial_heading])
+            for index in range(1500):
+                time = index * .02
+                visible = abs(pose[2]) < math.radians(8)
+                request = self.step(time, pose, camera=visible)
+                if request.visual_servo:
+                    break
+                self.assertEqual(self.nav.phase, 'REACQUIRE')
+                command = self.controller.compute_velocity_command(state(time, pose), request)
+                self.assertEqual(command.v_mps, 0.)
+                omega = math.copysign(max(0., abs(command.omega_rad_s) - .24), command.omega_rad_s)
+                pose[2] = wrap_angle(pose[2] + .02 * omega)
+            self.assertEqual(self.nav.phase, 'ALIGN', self.nav.status)
+            np.testing.assert_array_equal(pose[:2], [.5, 0.])
+            self.assertLessEqual(abs(pose[2]), math.radians(self.settings.reacquire_heading_tolerance_deg))
+
+    def test_missing_marker_sweeps_both_sides_then_stays_stopped(self):
+        pose = np.array([.5, 0., 0.])
+        headings = []
+        for index in range(1550):
+            time = index * .02
+            request = self.step(time, pose, camera=False)
+            command = self.controller.compute_velocity_command(state(time, pose), request)
+            self.assertEqual(command.v_mps, 0.)
+            self.assertEqual(self.nav.phase, 'REACQUIRE')
+            pose[2] = wrap_angle(pose[2] + .02 * command.omega_rad_s)
+            headings.append(pose[2])
+        self.assertGreater(max(headings), math.radians(25))
+        self.assertLess(min(headings), -math.radians(25))
+        self.assertLess(max(abs(h) for h in headings), math.radians(40))
+        for time in (40., 100.):
+            request = self.step(time, pose, camera=False)
+            self.assertTrue(request.stop_requested)
+            self.assertIn('timed out', self.nav.status)
+
+    def test_fresh_confirmations_can_release_timeout(self):
+        self.step(0, camera=False)
+        self.assertTrue(self.step(31, camera=False).stop_requested)
+        for time in (32., 32.02):
+            self.assertTrue(self.step(time).stop_requested)
+        self.assertEqual(self.step(32.04).mode, 'ALIGN')
+
+    def test_camera_correction_rechecks_coarse_region(self):
+        self.step(0)
+        self.step(.02)
+        corrected = replace(state(.04, (.5, 0, 0)), dock_pose_local=(2.4, 0, math.pi))
+        request = self.nav.motion_request(corrected, observations(.04, corrected.pose_local))
+        self.assertEqual(request.mode, 'APPROACH')
+        self.assertFalse(request.visual_servo)
+        np.testing.assert_allclose(self.nav.coarse_pose[:2], (.9, 0.), atol=1e-12)
+
+    def test_new_obstacle_rechecks_approach_corridor(self):
+        self.step(0)
+        self.step(.02)
+        request = self.step(.04, obstacles=[(1., 0.)])
+        self.assertEqual(self.nav.phase, 'AVOID')
+        self.assertFalse(request.visual_servo)
+
+    def test_lidar_stops_reacquisition_and_turn_reference_restarts(self):
+        pose = (.5, 0, 1.)
+        self.step(0, pose, camera=False)
+        self.assertTrue(self.step(1, pose, camera=False, scan_time=0).stop_requested)
+        self.assertTrue(self.step(2, pose, camera=False, obstacles=[(.5, .1)]).stop_requested)
+        request = self.step(3, pose, camera=False)
+        self.assertEqual(request.mode, 'REACQUIRE')
+        np.testing.assert_allclose(request.reference.pose_local, pose)
+        blocked = observations(3, pose, obstacles=[(.5, .1)])
+        self.assertFalse(self.nav.allow_motion(request, 0, -.4, blocked))
+
+    def test_turn_only_reference_never_chases_position_corrections(self):
+        trajectory = MotionTrajectory(self.settings)
+        target = np.array([.5, 0., 0.])
+        for time, pose in ((0., (.5, 0., 1.)), (5., (.7, .1, .8)), (10., (.4, -.1, .5))):
+            reference = trajectory.sample(time, pose, target, 0., turn_only=True)
+            self.assertEqual(reference.kind, 'TURN')
+            self.assertEqual(reference.v_mps, 0.)
+            np.testing.assert_allclose(trajectory.path()[:, :2], [pose[:2], pose[:2]])
 
 
 class MarkerAcquisitionTests(unittest.TestCase):

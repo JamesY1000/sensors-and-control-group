@@ -6,7 +6,7 @@ Currently its inputs are:
 - Robot-frame LiDAR points and scan timestamps (from perception)
 - Docking offsets, speeds, clearance and LiDAR timeout settings
 
-It has 3 main stages:
+It has 4 main stages:
 1. Explore:
    - Send a timed turning command while looking for a marker
    - When forward clearance is available, drive briefly and scan again
@@ -15,7 +15,11 @@ It has 3 main stages:
    - Track a full direct trajectory to the coarse dock region using LQI
    - No final heading is required before handing over using the estimated dock
    - Follow the sensed obstacle boundary when the direct approach is obstructed
-3. Dock:
+3. Reacquire:
+   - Turn in place with LQI to face the estimated dock
+   - Confirm recent accepted camera poses before allowing PBVS inward travel
+   - Try a limited angular sweep, then stop if reacquisition times out
+4. Dock:
    - PBVS first reaches and aligns at the approach pose
    - Then PBVS moves to the final offset until position and heading are in tolerance
 
@@ -29,6 +33,7 @@ passing side until the corridor clears, with a timeout if it cannot progress.
 LiDAR also checks the actual command; final docking stops when obstructed.
 """
 
+from collections import deque
 from dataclasses import dataclass
 import math
 
@@ -110,12 +115,15 @@ class MotionTrajectory:
         pose[2] = wrap_angle(pose[2])
         return pose
 
-    def _start(self, time, pose, target, speed, allow_curve=True, max_distance=math.inf):
+    def _start(self, time, pose, target, speed, allow_curve=True, max_distance=math.inf, turn_only=False):
         self._segment_id += 1
         self._start_time = time
         self._start_pose = np.array(pose, dtype=float)
         self._goal = np.array(target, dtype=float)
         delta = target[:2] - pose[:2]
+        if turn_only:
+            # Reacquisition must never translate, including after EKF corrections.
+            delta = np.zeros(2)
         distance = float(np.linalg.norm(delta))
         # Direct travel reaches the full target. Only detours limit the distance.
         # Keep the endpoint fixed while tracking instead of chasing the robot.
@@ -163,7 +171,7 @@ class MotionTrajectory:
                                  1.5*abs(sweep)/(.8*self.settings.turn_speed_rad_s),
                                  math.sqrt(6*abs(sweep)/.8))
 
-    def sample(self, time, pose, target, speed, *, allow_curve=True, max_distance=math.inf):
+    def sample(self, time, pose, target, speed, *, allow_curve=True, max_distance=math.inf, turn_only=False):
         pose, target = np.asarray(pose, dtype=float), np.asarray(target, dtype=float)
         restart = self._goal is None
         if not restart:
@@ -171,6 +179,7 @@ class MotionTrajectory:
             # absorbed at the next segment; larger changes restart from the estimate.
             restart = (np.linalg.norm(target[:2] - self._goal[:2]) > .05 or
                        abs(wrap_angle(target[2] - self._goal[2])) > math.radians(5))
+            restart |= turn_only and self._kind != 'TURN'
             if self._reference is not None:
                 reference = np.asarray(self._reference.pose_local)
                 restart |= (np.linalg.norm(pose[:2] - reference[:2]) > .15 or
@@ -190,7 +199,7 @@ class MotionTrajectory:
                     along, across = np.array([[c, s], [-s, c]]) @ (pose[:2] - end[:2])
                     restart |= abs(along) <= self.settings.position_tolerance_m and abs(across) > self.settings.position_tolerance_m
         if restart:
-            self._start(time, pose, target, speed, allow_curve, max_distance)
+            self._start(time, pose, target, speed, allow_curve, max_distance, turn_only)
         u = float(np.clip((time - self._start_time) / self._duration, 0, 1))
         progress = 3 * u**2 - 2 * u**3
         rate = 6 * u * (1 - u) / self._duration
@@ -221,7 +230,7 @@ class MotionRequest:
         return self.mode == 'STOP'
 
     def __post_init__(self) -> None:
-        if self.mode not in ('STOP', 'SCAN', 'EXPLORE', 'APPROACH', 'AVOID', 'ALIGN', 'DOCK'):
+        if self.mode not in ('STOP', 'SCAN', 'EXPLORE', 'APPROACH', 'AVOID', 'REACQUIRE', 'ALIGN', 'DOCK'):
             raise ValueError('Unknown motion mode')
         if not all(math.isfinite(v) for v in (self.time, self.speed_limit_mps, self.turn_rate_rad_s)):
             raise ValueError('Motion request values must be finite')
@@ -459,6 +468,63 @@ class Navigator:
         self._motion_blocked = False
         self._path_scan_time = None
         self._path_obstacles = np.empty((0, 2))
+        self._dock_observation_times = deque(maxlen=settings.reacquire_confirmations)
+        self._last_dock_observation_time = -math.inf
+        self._reset_reacquisition()
+
+    def _reset_reacquisition(self):
+        self._reacquire_started = None
+        self._reacquire_wait_since = None
+        self._reacquire_side = 0
+
+    def _observe_dock(self, time, perception):
+        """Remember distinct EKF-accepted frames, including just before handover.
+
+        main.update_demo removes rejected measurements before calling navigation.
+        Camera frames arrive more slowly than control ticks; missing a new frame
+        on one tick must not erase otherwise recent confirmation evidence.
+        """
+        observation = perception.dock_observation
+        max_age = self.settings.reacquire_observation_age_s
+        if (perception.new_camera_frame and observation is not None and
+                self._last_dock_observation_time < observation.time <= time and
+                time - observation.time <= max_age):
+            self._dock_observation_times.append(observation.time)
+            self._last_dock_observation_time = observation.time
+        while self._dock_observation_times and time - self._dock_observation_times[0] > max_age:
+            self._dock_observation_times.popleft()
+
+    def _reacquire_request(self, state, bearing):
+        """Face the dock, wait for vision, then sweep within a bounded angle/time."""
+        time = state.time
+        if time - self._reacquire_started >= self.settings.reacquire_timeout_s:
+            return self._stop(time, 'Marker reacquisition timed out; waiting for accepted camera poses')
+        # Accepted observations during a sweep bring the camera back towards the
+        # corrected dock bearing. Keep the EKF and its local frame throughout.
+        if self._dock_observation_times and self._reacquire_side:
+            self._reacquire_side = 0
+            self._reacquire_wait_since = None
+            self._trajectory.reset()
+        sweep = math.radians(self.settings.reacquire_sweep_deg)
+        error = wrap_angle(bearing + self._reacquire_side * sweep)
+        if abs(error) <= math.radians(self.settings.heading_tolerance_deg):
+            self._trajectory.reset()
+            if self._reacquire_wait_since is None:
+                self._reacquire_wait_since = time
+            if time - self._reacquire_wait_since < self.settings.reacquire_wait_s:
+                self.status = (f'Reacquiring dock: holding for camera '
+                               f'({len(self._dock_observation_times)}/{self.settings.reacquire_confirmations} recent poses)')
+                return MotionRequest(time, 'REACQUIRE')
+            self._reacquire_side = -1 if self._reacquire_side > 0 else 1
+            self._reacquire_wait_since = None
+            error = wrap_angle(bearing + self._reacquire_side * sweep)
+        else:
+            self._reacquire_wait_since = None
+        target = np.array([*state.pose_local[:2], wrap_angle(state.pose_local[2] + error)])
+        reference = self._trajectory.sample(time, state.pose_local, target, 0., turn_only=True)
+        self.status = ('LQI: turning to face the estimated dock' if not self._reacquire_side else
+                       f'LQI: reacquisition sweep ({self.settings.reacquire_sweep_deg:g} deg each side)')
+        return MotionRequest(time, 'REACQUIRE', reference=reference)
 
     def _explore(self, time, perception):
         """Alternate timed wheel commands; LiDAR decides whether forward travel is clear."""
@@ -538,6 +604,7 @@ class Navigator:
             raise ValueError('Navigation timestamps must increase; recreate navigation on reset')
         dt = 0. if self._previous_time is None else time - self._previous_time
         self._previous_time = time
+        self._observe_dock(time, perception)
         if self._search_active:
             self._search_remaining -= dt
         self._search_active = False
@@ -572,9 +639,9 @@ class Navigator:
             self.phase = 'APPROACH' if result == 'clear' else 'AVOID'
             if result != 'clear':
                 return self._stop(time, self._detour.reason)
-        # After first acquisition, continue from encoder prediction for as long
-        # as needed. Fresh accepted camera poses correct the EKF when available;
-        # marker loss never starts a stop, reacquisition turn or new local frame.
+        # Coarse travel continues from encoder prediction during occlusion.
+        # REACQUIRE confirms vision once before PBVS; ALIGN/DOCK can subsequently
+        # bridge marker loss using the same estimate, without resetting odometry.
 
         dock_base = state.dock_pose_base
         coarse = dock_target_pose(dock_base, self.settings.coarse_distance_m)
@@ -582,16 +649,34 @@ class Navigator:
         final = dock_target_pose(dock_base, self.settings.dock_distance_m)
         # Reach the actual stand-off point along the dock normal before PBVS.
         # Distance to the dock alone would admit close sideways approaches.
-        # Heading remains free: PBVS handles the precise alignment afterwards.
+        # Arrival heading stays free; REACQUIRE faces the dock before PBVS.
         front = -np.dot(dock_base[:2], [math.cos(dock_base[2]), math.sin(dock_base[2])])
         at_coarse = front > 0 and np.linalg.norm(coarse[:2]) <= self.settings.coarse_tolerance_m
-        if self.phase in ('APPROACH', 'AVOID') and at_coarse and corridor_is_clear(
-                perception.lidar_points_base, approach[:2], self.settings.clearance_m):
-            # The stored joint estimate also supports handover during occlusion.
-            self.phase = 'ALIGN'
+        approach_clear = corridor_is_clear(perception.lidar_points_base, approach[:2], self.settings.clearance_m)
+        if self.phase in ('APPROACH', 'AVOID') and at_coarse and approach_clear:
+            self.phase = 'REACQUIRE'
+            self._reset_reacquisition()
+            self._reacquire_started = time
             self._trajectory.reset()
             self._detour.reset()
             self._motion_blocked = False
+
+        if self.phase == 'REACQUIRE':
+            if not at_coarse or not approach_clear:
+                # A camera correction or new obstacle can invalidate the handover
+                # region. Replan using the corrected estimate before moving in.
+                self.phase = 'APPROACH'
+                self._reset_reacquisition()
+                self._trajectory.reset()
+            else:
+                bearing = math.atan2(dock_base[1], dock_base[0])
+                confirmed = len(self._dock_observation_times) == self.settings.reacquire_confirmations
+                if confirmed and abs(bearing) <= math.radians(self.settings.reacquire_heading_tolerance_deg):
+                    self.phase = 'ALIGN'
+                    self._reset_reacquisition()
+                    self._trajectory.reset()
+                else:
+                    return self._reacquire_request(state, bearing)
 
         if self.phase in ('APPROACH', 'AVOID'):
             # Only after reaching the stand-off region may avoidance aim towards

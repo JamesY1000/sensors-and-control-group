@@ -37,23 +37,35 @@ On Windows use `python` and activate `.venv\Scripts\Activate.ps1`.
    1.5 m in front of the estimated dock. Arrival heading is not constrained.
    Handover requires being within 0.25 m of that specific offset point, plus a
    clear corridor to the PBVS approach offset. Being close to the dock from the
-   side is insufficient. The stored EKF estimate supports handover during occlusion.
-4. **ALIGN:** PBVS directly commands forward/angular velocity to reach the configured
+   side is insufficient. When blocked, **AVOID** follows an obstacle boundary with
+   LQI until the direct route clears.
+4. **REACQUIRE:** hold position and use an LQI turn to face the estimated dock.
+   Before inward travel, require three distinct EKF-accepted camera observations
+   from the last 0.5 s and a dock bearing within 10 degrees of straight ahead.
+   Recent observations from coarse travel can satisfy the gate immediately.
+   Otherwise, wait 1 s when facing the dock, then sweep up to 30 degrees to either
+   side, pausing at each end. Stop after 30 s without confirmation; fresh
+   confirmations can release that stop when the heading and geometry also qualify.
+   Recheck the coarse region and approach corridor after camera corrections or new
+   obstacles; return to APPROACH/AVOID if either is invalidated.
+5. **ALIGN:** PBVS directly commands forward/angular velocity to reach the configured
    approach offset (currently 0.70 m) and face into the dock. There is no timed trajectory in this phase.
-5. **DOCK:** PBVS moves to the 0.30 m offset at the lower docking speed.
-6. **DONE:** stop when both estimated position and heading meet their tolerances.
+   Reach both the 3 cm position and 3 degree heading tolerances before proceeding.
+6. **DOCK:** PBVS moves to the 0.30 m offset at the lower docking speed.
+7. **DONE:** stop when both estimated position and heading meet their tolerances.
 
 Odometry starts at first acquisition. A detected ID alone is insufficient:
 the marker pose must pass the size, reprojection, ambiguity and physical-consistency
 checks.
 
-After first acquisition, all travel phases continue using encoder prediction and
-the stored joint robot/dock estimate for as long as necessary. There is no camera-loss
-timeout, reacquisition turn, WAIT_MARKER state or fresh-frame confirmation gate.
-New accepted camera poses still correct the EKF when they arrive, without resetting
-odometry. ALIGN and DOCK use the predicted relative dock pose during occlusion;
-completion is based on estimated pose tolerances. Longer gaps can accumulate drift.
-LiDAR freshness/collision stops, obstacle-recovery limits and DONE remain active.
+After first acquisition, coarse travel continues using encoder prediction during
+marker loss. REACQUIRE adds a camera confirmation gate at the handover to PBVS;
+it does not reset odometry or the dock estimate. New accepted camera poses correct
+the same EKF throughout. After that gate, ALIGN and DOCK can still use the predicted
+relative dock pose during occlusion; completion is based on estimated pose tolerances.
+There is no additional camera-loss timeout within ALIGN/DOCK. Longer gaps can
+accumulate drift. LiDAR freshness/collision stops, obstacle-recovery limits and DONE
+remain active, including during reacquisition turns and sweeps.
 
 ## Frames and estimation
 
@@ -102,6 +114,11 @@ Detours can use circular arcs tangent to the current heading. A bearing beyond
 60 degrees or a blocked arc uses a spot turn first. Coarse approach hands over
 within the tolerance around its stand-off point, without demanding dock-facing
 arrival heading. PBVS then handles the finer position and heading alignment.
+Between these stages, REACQUIRE uses an explicit turn-only reference to point the
+camera towards the dock. Position corrections cannot turn that reference into a
+drive. Its confirmation gate counts distinct accepted camera timestamps, not control
+ticks or raw marker IDs. Configure its heading tolerance, observation age, frame
+count, dwell, sweep and timeout with the `reacquire_*` navigation settings.
 Each segment uses cubic progress `s=3u²-2u³`, where `u` is elapsed time
 divided by duration. Reference velocity starts and ends at zero. Duration limits
 peak speed and acceleration, reserving 20% of the speed limit for feedback.
@@ -335,7 +352,7 @@ noise sequence means their estimated trajectories are not identical.
 
 ## Validation and limitations
 
-Run `python3 -m unittest discover -s tests -v`. All 68 automated checks pass.
+Run `python3 -m unittest discover -s tests -v`. All 78 automated checks pass.
 Checks cover ignored pre-acquisition encoder travel, zero-origin initialisation,
 post-acquisition correction without resetting, timed exploration, LiDAR stops,
 LQI/PBVS tracking, arc kinematics, curved-reference LQI stability, full-curve
@@ -344,7 +361,18 @@ cover full direct references without intermediate stops, distant new obstacles,
 resuming direct travel after clearance, ignoring obstacles beyond the goal, and
 approaching distant blockers before starting boundary following. Handover checks
 cover side arrivals, starts too close to the dock, rotated dock normals, free
-arrival heading, and a blocked PBVS approach corridor.
+arrival heading, and a blocked PBVS approach corridor. Reacquisition checks cover
+distinct/recent accepted frames, immediate handover with existing visual evidence,
+turning without translation despite wheel friction, bounded sweeps and timeout,
+fresh-camera recovery, corrected target geometry, new obstacles, and LiDAR stops.
+With the reacquisition gate enabled, a camera-rendered close angled start at robot
+`(0.8, 0.15, 150 degrees)` and dock `(-0.8, 0, 0 degrees)` entered REACQUIRE at
+0.74 s, ALIGN at 1.92 s, DOCK at 16.38 s and DONE at 35.88 s. The check asserted
+zero commanded forward speed throughout REACQUIRE and finished within the
+estimated 3 cm / 3 degree docking tolerances. World poses only placed the scene;
+navigation and control used the encoder/camera EKF. This checks one placement,
+not reliability across the whole room.
+The rendered trials below predate the reacquisition gate unless stated otherwise.
 With the stricter stand-off gate, a rendered side-start trial (robot 3, 1.2,
 -90 degrees; dock 2.5, 0, 0 degrees) switched to PBVS at 0.247 m from the
 coarse target and completed estimated docking at 101.64 simulated seconds.
@@ -364,7 +392,8 @@ completed PBVS docking at 41.50 simulated seconds within the estimated tolerance
 These world coordinates only set the physical test scene; the pipeline starts
 its local frame at first camera acquisition.
 Marker-loss checks cover APPROACH, ALIGN and DOCK through 10,000 s without a
-camera update, including phase transitions and resumed EKF-derived target updates.
+camera update, including phase transitions after successful reacquisition and
+resumed EKF-derived target updates. Entering PBVS now requires confirmation first.
 A camera-rendered close-start run withheld all dock observations after 5 s and
 reached estimated DONE at 23.64 s using encoder prediction for the remaining travel.
 

@@ -10,7 +10,7 @@ It has 3 main stages:
 2. Select the feedback law for the current phase:
    - LQI adds feedback to reference velocity during coarse approach/detours.
    - Driving uses along-track, cross-track, heading and integrated along-track error.
-   - Turning uses heading and integrated heading error, with zero forward speed.
+   - Turning, including marker reacquisition, uses heading and integrated heading error, with zero forward speed.
    - PBVS commands velocity directly from the estimated dock-relative pose error.
 3. Limit the command and convert it into left/right wheel speeds.
 

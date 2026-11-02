@@ -106,6 +106,12 @@ class NavigationConfig:
     lidar_timeout_s: float
     search_spin_s: float
     search_drive_s: float
+    reacquire_heading_tolerance_deg: float
+    reacquire_observation_age_s: float
+    reacquire_confirmations: int
+    reacquire_wait_s: float
+    reacquire_sweep_deg: float
+    reacquire_timeout_s: float
     progress_timeout_s: float
     boundary_join_gap_m: float
     detour_step_m: float
@@ -126,6 +132,14 @@ class NavigationConfig:
             raise ValueError("Docking speed must not exceed approach speed")
         if self.heading_tolerance_deg >= 90:
             raise ValueError("Heading tolerance must be less than 90 degrees")
+        if not self.heading_tolerance_deg <= self.reacquire_heading_tolerance_deg < 90:
+            raise ValueError("Reacquisition heading tolerance must be between docking tolerance and 90 degrees")
+        if not isinstance(self.reacquire_confirmations, int) or self.reacquire_confirmations < 2:
+            raise ValueError("Reacquisition requires at least two distinct camera observations")
+        if self.reacquire_sweep_deg >= 90:
+            raise ValueError("Reacquisition sweep must be less than 90 degrees on each side")
+        if self.reacquire_timeout_s <= self.reacquire_wait_s:
+            raise ValueError("Reacquisition timeout must exceed the camera wait")
         if self.detour_speed_mps > self.drive_speed_mps:
             raise ValueError("Detour speed must not exceed approach speed")
 

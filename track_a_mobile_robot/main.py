@@ -4,7 +4,7 @@ Our main file connects the sensor-only docking pipeline.
 1. Build the simulation using YAML spawn poses and sensor settings. Spawn poses
    only place physical objects; they are not passed to robot algorithms.
 2. Create perception, a local EKF, navigation and control.
-3. Read sensors, explore using timed commands, acquire a dock marker, track coarse/detour trajectories with LQI, then dock using PBVS.
+3. Read sensors, explore using timed commands, acquire a dock marker, track coarse/detour trajectories with LQI, reacquire the marker, then dock using PBVS.
    LiDAR checks motion clearance for both controllers.
 
 The GUI shows camera/map panels and a robot-relative 3D preview. Only display
