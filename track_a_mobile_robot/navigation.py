@@ -47,7 +47,7 @@ from .state_model import wrap_angle
 
 @dataclass(frozen=True)
 class TrajectoryReference:
-    """Store a sample of a turning or curved-driving trajectory in local odometry."""
+    """Store a sample of a turning or straight-driving trajectory in local odometry."""
 
     time: float
     pose_local: tuple[float, float, float]
@@ -68,7 +68,7 @@ class TrajectoryReference:
 
 
 class MotionTrajectory:
-    """Generate direct turn/drive references or short arcs for obstacle detours."""
+    """Generate spot turns and straight drives for approach and obstacle detours."""
 
     def __init__(self, settings):
         self.settings = settings
@@ -90,32 +90,20 @@ class MotionTrajectory:
                           self._reference.pose_local))
 
     def path(self, remaining=False):
-        """Return line endpoints or sample arcs at about 2.5 cm for checking/display."""
+        """Return segment endpoints for continuous line-clearance checks/display."""
         if self._reference is None:
             return None
-        # A straight line needs only its endpoints: the collision check covers
-        # every point along each chord, so longer approaches add no sample cost.
-        count = (2 if abs(self._curvature) < 1e-8 else
-                 max(2, math.ceil(abs(self._signed_distance)/.025) + 1))
-        progress = np.linspace(self._progress if remaining else 0., 1., count)
-        return np.array([self._pose_at(value) for value in progress])
+        return np.array([self._pose_at(self._progress if remaining else 0.),
+                         self._pose_at(1.)])
 
     def _pose_at(self, progress):
-        pose = self._start_pose.copy()
-        pose[2] += progress*self._delta[2]
-        if self._kind == 'DRIVE':
-            if abs(self._curvature) < 1e-8:
-                pose[:2] += progress*self._signed_distance*np.array([np.cos(pose[2]), np.sin(pose[2])])
-            else:
-                # Integrate the constant-curvature differential-drive arc exactly.
-                start_heading = self._start_pose[2]
-                pose[:2] += self._direction/self._curvature*np.array([
-                    np.sin(pose[2])-np.sin(start_heading),
-                    np.cos(start_heading)-np.cos(pose[2])])
+        """Interpolate position for a drive or heading for a spot turn."""
+        pose = self._start_pose + progress*self._delta
         pose[2] = wrap_angle(pose[2])
         return pose
 
-    def _start(self, time, pose, target, speed, allow_curve=True, max_distance=math.inf, turn_only=False):
+    def _start_segment(self, time, pose, target, speed, max_distance=math.inf, turn_only=False):
+        """Turn towards the target, then drive straight with a speed-limited duration."""
         self._segment_id += 1
         self._start_time = time
         self._start_pose = np.array(pose, dtype=float)
@@ -140,11 +128,9 @@ class MotionTrajectory:
                 heading = wrap_angle(heading + math.pi)
                 speed = min(speed, self.settings.dock_speed_mps)
         angle = wrap_angle(heading - pose[2])
-        # An arc starts tangent to the current heading. Large bearing changes or
-        # narrow gaps use a spot turn instead of a large sweeping manoeuvre.
-        max_bearing = math.pi/3 if allow_curve else math.radians(self.settings.heading_tolerance_deg)/2
+        # Align first; LQI removes the small remaining heading error during travel.
+        max_bearing = math.radians(self.settings.heading_tolerance_deg)/2
         self._direction = direction
-        self._curvature = 0.
         if distance <= self.settings.position_tolerance_m or abs(angle) > max_bearing:
             self._kind = 'TURN'
             self._delta = np.array([0., 0., angle])
@@ -153,53 +139,56 @@ class MotionTrajectory:
                                  math.sqrt(6*abs(angle)/.8))
         else:
             self._kind = 'DRIVE'
-            if not allow_curve:
-                # The turn has aligned us within tolerance. Use the exact line
-                # heading; LQI removes any small remaining heading error.
-                self._start_pose[2] = heading
-                angle = 0.
-            # A circle through the target, tangent at the start, turns by twice
-            # the target bearing. Arrival heading is free during coarse travel.
-            sweep = 2*angle
-            length = distance if abs(angle) < 1e-8 else distance*angle/math.sin(angle)
-            self._curvature = sweep/length
-            self._signed_distance = direction*length
-            self._delta = np.array([*delta, sweep])
-            # Cubic progress s=3u²-2u³ starts/stops smoothly. Bound both linear
-            # and angular speed/acceleration, reserving 20% for tracking feedback.
-            self._duration = max(.02, 1.5*length/(.8*speed), math.sqrt(6*length/.15),
-                                 1.5*abs(sweep)/(.8*self.settings.turn_speed_rad_s),
-                                 math.sqrt(6*abs(sweep)/.8))
+            self._start_pose[2] = heading
+            self._signed_distance = direction*distance
+            self._delta = np.array([*delta, 0.])
+            # Cubic progress starts/stops smoothly. Limit speed and acceleration,
+            # reserving 20% of the speed limit for tracking feedback.
+            self._duration = max(.02, 1.5*distance/(.8*speed), math.sqrt(6*distance/.15))
 
-    def sample(self, time, pose, target, speed, *, allow_curve=True, max_distance=math.inf, turn_only=False):
+    def _needs_new_segment(self, time, pose, target, turn_only):
+        """Restart for a changed goal, large tracking error or a completed segment."""
+        if self._goal is None:
+            return True
+        # Camera corrections can move the local target. Small changes are
+        # absorbed at the next segment; larger changes restart from the estimate.
+        restart = (np.linalg.norm(target[:2] - self._goal[:2]) > .05 or
+                   abs(wrap_angle(target[2] - self._goal[2])) > math.radians(5))
+        restart |= turn_only and self._kind != 'TURN'
+        if self._reference is not None:
+            reference = np.asarray(self._reference.pose_local)
+            restart |= (np.linalg.norm(pose[:2] - reference[:2]) > .15 or
+                        abs(wrap_angle(pose[2] - reference[2])) > math.radians(25))
+        if time >= self._start_time + self._duration:
+            # Wait for the tracker to settle before advancing to the next
+            # segment. Integral action can then overcome low-speed friction.
+            end = self._start_pose + self._delta
+            settled = (abs(wrap_angle(pose[2] - end[2])) <= math.radians(self.settings.heading_tolerance_deg) / 2
+                       if self._kind == 'TURN' else
+                       np.linalg.norm(pose[:2] - end[:2]) <= self.settings.position_tolerance_m)
+            restart |= settled
+            # A stationary differential drive cannot remove lateral error.
+            # If the segment ends with lateral error, generate a new segment.
+            if self._kind == 'DRIVE':
+                c, s = math.cos(end[2]), math.sin(end[2])
+                along, across = np.array([[c, s], [-s, c]]) @ (pose[:2] - end[:2])
+                restart |= abs(along) <= self.settings.position_tolerance_m and abs(across) > self.settings.position_tolerance_m
+        return bool(restart)
+
+    def generate_reference(self, time, pose, target, speed, *,
+                           max_distance=math.inf, turn_only=False) -> TrajectoryReference:
+        """Return the desired pose and velocities for this control timestamp.
+
+        Keep the active segment until it finishes or needs replacing. Evaluate
+        it analytically rather than storing a list of timed trajectory points.
+        path() separately supplies points for collision checks and the display.
+        """
         pose, target = np.asarray(pose, dtype=float), np.asarray(target, dtype=float)
-        restart = self._goal is None
-        if not restart:
-            # Camera corrections can move the local target. Small changes are
-            # absorbed at the next segment; larger changes restart from the estimate.
-            restart = (np.linalg.norm(target[:2] - self._goal[:2]) > .05 or
-                       abs(wrap_angle(target[2] - self._goal[2])) > math.radians(5))
-            restart |= turn_only and self._kind != 'TURN'
-            if self._reference is not None:
-                reference = np.asarray(self._reference.pose_local)
-                restart |= (np.linalg.norm(pose[:2] - reference[:2]) > .15 or
-                            abs(wrap_angle(pose[2] - reference[2])) > math.radians(25))
-            if time >= self._start_time + self._duration:
-                # Wait for the tracker to settle before advancing to the next
-                # segment. Integral action can then overcome low-speed friction.
-                end = self._start_pose + self._delta
-                settled = (abs(wrap_angle(pose[2] - end[2])) <= math.radians(self.settings.heading_tolerance_deg) / 2
-                           if self._kind == 'TURN' else
-                           np.linalg.norm(pose[:2] - end[:2]) <= self.settings.position_tolerance_m)
-                restart |= settled
-                # A stationary differential drive cannot remove lateral error.
-                # If the segment ends with lateral error, generate a new segment.
-                if self._kind == 'DRIVE':
-                    c, s = math.cos(end[2]), math.sin(end[2])
-                    along, across = np.array([[c, s], [-s, c]]) @ (pose[:2] - end[:2])
-                    restart |= abs(along) <= self.settings.position_tolerance_m and abs(across) > self.settings.position_tolerance_m
-        if restart:
-            self._start(time, pose, target, speed, allow_curve, max_distance, turn_only)
+        if self._needs_new_segment(time, pose, target, turn_only):
+            self._start_segment(time, pose, target, speed, max_distance, turn_only)
+
+        # Cubic progress starts and ends at zero speed. Its time derivative
+        # converts the segment's distance and heading change into v_ref/omega_ref.
         u = float(np.clip((time - self._start_time) / self._duration, 0, 1))
         progress = 3 * u**2 - 2 * u**3
         rate = 6 * u * (1 - u) / self._duration
@@ -273,7 +262,7 @@ def motion_is_clear(points_base: np.ndarray, v: float, omega: float, clearance: 
 
 
 def path_is_clear(points_base, path_base, clearance):
-    """Check the circular footprint along every chord of a sampled curve."""
+    """Check the circular footprint continuously along each straight path segment."""
     points, path = np.asarray(points_base), np.asarray(path_base)
     if not np.isfinite(points).all() or not np.isfinite(path).all():
         return False
@@ -283,7 +272,7 @@ def path_is_clear(points_base, path_base, clearance):
     delta = points[:, None, :] - starts
     fraction = np.clip(np.sum(delta*edges, axis=2) / np.maximum(np.sum(edges**2, axis=1), 1e-12), 0, 1)
     distance = np.linalg.norm(delta - fraction[:, :, None]*edges, axis=2)
-    # The curve is sampled at <=2.5 cm; 1 cm padding covers chord approximation.
+    # Retain 1 cm of extra clearance beyond the configured footprint margin.
     return bool(np.all(distance >= clearance + .01))
 
 
@@ -521,7 +510,7 @@ class Navigator:
         else:
             self._reacquire_wait_since = None
         target = np.array([*state.pose_local[:2], wrap_angle(state.pose_local[2] + error)])
-        reference = self._trajectory.sample(time, state.pose_local, target, 0., turn_only=True)
+        reference = self._trajectory.generate_reference(time, state.pose_local, target, 0., turn_only=True)
         self.status = ('LQI: turning to face the estimated dock' if not self._reacquire_side else
                        f'LQI: reacquisition sweep ({self.settings.reacquire_sweep_deg:g} deg each side)')
         return MotionRequest(time, 'REACQUIRE', reference=reference)
@@ -573,17 +562,14 @@ class Navigator:
         pose = np.asarray(state.pose_local)
         c, s = math.cos(pose[2]), math.sin(pose[2])
         rotation = np.array([[c, -s], [s, c]])
-        # Direct approach turns then follows one full line. Detours may use a
-        # short arc, falling back to a turn if it cannot fit. Check the entire
-        # remaining reference on every update, not just its first metre.
-        for allow_curve in ((False,) if direct else (True, False)):
-            reference = self._trajectory.sample(state.time, pose, target, speed,
-                                                allow_curve=allow_curve, max_distance=horizon)
-            path = np.vstack((pose[:2], self._trajectory.path(remaining=True)[:, :2]))
-            path_base = (path - pose[:2]) @ rotation
-            if path_is_clear(self._path_obstacles, path_base, self.settings.clearance_m):
-                return MotionRequest(state.time, self.phase, speed, offset, reference=reference)
-            self._trajectory.reset()
+        # Approach and detours both turn then drive straight. Check the entire
+        # remaining segment, including the connection from the estimated pose.
+        reference = self._trajectory.generate_reference(
+            state.time, pose, target, speed, max_distance=horizon)
+        path = np.vstack((pose[:2], self._trajectory.path(remaining=True)[:, :2]))
+        path_base = (path - pose[:2]) @ rotation
+        if path_is_clear(self._path_obstacles, path_base, self.settings.clearance_m):
+            return MotionRequest(state.time, self.phase, speed, offset, reference=reference)
         self._motion_blocked = True
         self._detour.target = None
         return self._stop(state.time, 'Trajectory blocked by LiDAR; choosing a detour')

@@ -110,8 +110,8 @@ the robot first approaches along a clear prefix with a stand-off, then boundary
 following supplies short detour targets; once the corridor clears,
 navigation generates a new full direct reference from the current estimate.
 
-Detours can use circular arcs tangent to the current heading. A bearing beyond
-60 degrees or a blocked arc uses a spot turn first. Coarse approach hands over
+Detours use the same spot-turn-then-straight-drive generator as direct approach,
+with short targets selected by boundary following. Coarse approach hands over
 within the tolerance around its stand-off point, without demanding dock-facing
 arrival heading. PBVS then handles the finer position and heading alignment.
 Between these stages, REACQUIRE uses an explicit turn-only reference to point the
@@ -125,23 +125,23 @@ peak speed and acceleration, reserving 20% of the speed limit for feedback.
 Short detours can still slow or stop between segments. There is no A*, occupancy
 grid or global route search; unseen space is not certified clear by a LiDAR check.
 
-`MotionController` applies `u = u_ref - K z`. During curved or straight driving,
+`MotionController` applies `u = u_ref - K z`. During straight-reference driving,
 `z = [e_along, e_across, e_heading, integral(e_along)]`, with errors defined as
 estimated minus reference pose in reference-heading axes. The linearised model is:
 
 ```text
-e_along_dot   = omega_ref * e_across + delta_v
-e_across_dot  = -omega_ref * e_along + v_ref * e_heading
+e_along_dot   = delta_v
+e_across_dot  = v_ref * e_heading
 e_heading_dot = delta_omega
 integral_dot  = e_along
 ```
 
 The gain is computed from the continuous algebraic Riccati equation using SciPy,
 with `Q=diag(4,16,2,4)` and `R=diag(4,1)`. Gains are cached for signed reference
-speeds rounded to 0.01 m/s and turn rates rounded to 0.01 rad/s. At ramp endpoints a minimum design speed of 0.02 m/s
+speeds rounded to 0.01 m/s. At ramp endpoints a minimum design speed of 0.02 m/s
 avoids the uncontrollable zero-speed Cartesian pose linearisation. This is a local
 moving-reference design, not a claim of full-pose stability at rest. Navigation
-starts a new segment if a finished arc leaves significant lateral error. Segments
+starts a new segment if a finished straight drive leaves significant lateral error. Segments
 start and end at zero reference speed; this is not a continuous-speed spline route.
 
 In-place turns use a separate heading/integral model with `Q=diag(4,4)` and `R=1`;
@@ -174,12 +174,11 @@ produce an approximate 0.23 rad/s in-place turning deadband. The former
 fresh camera measurements. ALIGN/DOCK logs show position and heading errors
 relative to the estimated target, rather than requiring interpretation of odometry.
 
-Before tracking, navigation uses the endpoints of a straight reference or samples
-a detour curve at at most 2.5 cm spacing. It checks the swept circular footprint along every sampled chord
-against grouped LiDAR returns, with 1 cm extra padding for the chord approximation.
-It also checks the connection from the actual estimated position to the remaining
-reference. A blocked arc is retried with a spot turn; if that also fails, navigation
-stops and selects a detour. This check repeats during tracking using the latest scan.
+Before tracking, navigation checks the swept circular footprint continuously
+between the endpoints of each straight segment against grouped LiDAR returns,
+with 1 cm extra padding. It also checks the connection from the actual estimated
+position to the remaining reference. If blocked, navigation stops and selects a
+detour. This check repeats during tracking using the latest scan.
 
 Before applying each command, LiDAR separately checks its swept circular footprint over the
 next second, including curved, reverse and in-place motion. A blocked command
@@ -355,8 +354,8 @@ noise sequence means their estimated trajectories are not identical.
 Run `python3 -m unittest discover -s tests -v`. All 78 automated checks pass.
 Checks cover ignored pre-acquisition encoder travel, zero-origin initialisation,
 post-acquisition correction without resetting, timed exploration, LiDAR stops,
-LQI/PBVS tracking, arc kinematics, curved-reference LQI stability, full-curve
-collision checks, turn fallback and nonblocking display uploads. Additional checks
+LQI/PBVS tracking, turn/straight-drive kinematics, LQI stability, full-segment
+collision checks, detour horizon limits and nonblocking display uploads. Additional checks
 cover full direct references without intermediate stops, distant new obstacles,
 resuming direct travel after clearance, ignoring obstacles beyond the goal, and
 approaching distant blockers before starting boundary following. Handover checks

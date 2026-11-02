@@ -463,10 +463,10 @@ class LQITests(unittest.TestCase):
         for target in ((1., 0., 0.), (-.5, 0., 0.), (0., 0., math.pi / 2)):
             generator = MotionTrajectory(self.settings)
             pose = np.zeros(3)
-            previous = generator.sample(0, pose, target, .15)
+            previous = generator.generate_reference(0, pose, target, .15)
             for i in range(1, 1000):
                 time = i * .01
-                reference = generator.sample(time, pose, target, .15)
+                reference = generator.generate_reference(time, pose, target, .15)
                 if reference.segment_id != previous.segment_id:
                     break
                 self.assertLessEqual(abs(reference.v_mps), .15)
@@ -479,36 +479,43 @@ class LQITests(unittest.TestCase):
                 pose = np.array(reference.pose_local)
                 previous = reference
 
-    def test_arc_is_tangent_and_has_consistent_linear_and_angular_velocity(self):
+    def test_detours_turn_then_drive_with_consistent_velocities(self):
         for target in ((1., .4, 0.), (1., -.4, 0.), (-1., .4, 0.)):
             trajectory = MotionTrajectory(self.settings)
-            initial = trajectory.sample(0, np.zeros(3), target, .15, max_distance=2.)
+            turn = trajectory.generate_reference(0, np.zeros(3), target, .15)
+            self.assertEqual(turn.kind, 'TURN')
+            self.assertEqual(turn.v_mps, 0.)
+            np.testing.assert_allclose(trajectory.path()[:, :2], np.zeros((2, 2)))
+            start_time = trajectory._duration + .02
+            pose = trajectory._pose_at(1.)
+            initial = trajectory.generate_reference(start_time, pose, target, .15)
             self.assertEqual(initial.kind, 'DRIVE')
-            self.assertAlmostEqual(initial.pose_local[2], 0.)
-            np.testing.assert_allclose(trajectory._pose_at(1)[:2], target[:2], atol=1e-12)
+            np.testing.assert_allclose(trajectory.path()[-1, :2], target[:2], atol=1e-12)
             previous = initial
             dt = trajectory._duration/1000
             for i in range(1, 1000):
-                reference = trajectory.sample(i*dt, previous.pose_local, target, .15, max_distance=2.)
+                reference = trajectory.generate_reference(start_time+i*dt, previous.pose_local, target, .15)
                 self.assertEqual(reference.segment_id, initial.segment_id)
                 velocity = (np.array(reference.pose_local[:2])-previous.pose_local[:2])/dt
-                heading = previous.pose_local[2]+wrap_angle(reference.pose_local[2]-previous.pose_local[2])/2
+                heading = reference.pose_local[2]
                 speed = (reference.v_mps+previous.v_mps)/2
                 np.testing.assert_allclose(velocity, speed*np.array([math.cos(heading), math.sin(heading)]), atol=1e-6)
-                self.assertAlmostEqual(wrap_angle(reference.pose_local[2]-previous.pose_local[2])/dt,
-                                       (reference.omega_rad_s+previous.omega_rad_s)/2, places=6)
+                self.assertEqual(reference.omega_rad_s, 0.)
+                self.assertAlmostEqual(heading, initial.pose_local[2])
                 self.assertLessEqual(abs(reference.v_mps), .15)
-                self.assertLessEqual(abs(reference.omega_rad_s), self.settings.turn_speed_rad_s)
                 previous = reference
 
-    def test_curve_check_detects_obstacle_outside_straight_chord(self):
-        trajectory = MotionTrajectory(self.settings)
-        trajectory.sample(0, np.zeros(3), (1., .5, 0.), .15, max_distance=2.)
-        obstacle = np.array([[.55,.11]])
-        self.assertTrue(corridor_is_clear(obstacle, [1.,.5], .05))
-        self.assertFalse(path_is_clear(obstacle, trajectory.path()[:,:2], .05))
+    def test_detour_stops_for_obstacle_between_line_endpoints(self):
+        nav = Navigator(self.settings)
+        nav.phase = 'AVOID'
+        pose = (0., 0., 0.)
+        request = nav._tracking_request(state(0, pose), None, self.settings.detour_speed_mps,
+            observations(0, pose, obstacles=[(.5, 0.)]), target=np.array([1., 0., 0.]))
+        self.assertTrue(request.stop_requested)
+        self.assertTrue(nav._motion_blocked)
+        self.assertIsNone(nav.trajectory_path)
 
-    def test_blocked_arc_falls_back_to_a_checked_spot_turn(self):
+    def test_detour_starts_with_a_collision_checked_spot_turn(self):
         nav = Navigator(self.settings)
         nav.phase = 'AVOID'
         estimate = replace(state(0, (0,0,0)), dock_pose_local=(2.5,.5,math.pi))
@@ -518,25 +525,25 @@ class LQITests(unittest.TestCase):
         self.assertEqual(request.reference.kind, 'TURN')
         self.assertTrue(path_is_clear(np.array([[.5,-.14]]), nav.trajectory_path[:,:2], self.settings.clearance_m))
 
-    def test_reference_horizon_and_curved_lqi_design(self):
+    def test_detour_drive_respects_reference_horizon(self):
         trajectory = MotionTrajectory(self.settings)
-        trajectory.sample(0, np.zeros(3), (5.,2.,0.), .15, max_distance=1.)
-        self.assertLessEqual(np.linalg.norm(trajectory.path()[:,:2],axis=1).max(), 1.+1e-9)
-        for turn in (-.4,.4):
-            A,B,_,_ = lqi_model(.15,turn)
-            self.assertEqual(A[0,1],turn)
-            self.assertEqual(A[1,0],-turn)
-            self.assertTrue(np.all(np.linalg.eigvals(A-B@driving_gain(.15,turn)).real<0))
+        target = (5., 2., 0.)
+        trajectory.generate_reference(0, np.zeros(3), target, .15, max_distance=1.)
+        time = trajectory._duration + .02
+        pose = trajectory._pose_at(1.)
+        reference = trajectory.generate_reference(time, pose, target, .15, max_distance=1.)
+        self.assertEqual(reference.kind, 'DRIVE')
+        self.assertAlmostEqual(np.linalg.norm(trajectory.path()[-1, :2]), 1.)
 
     def test_direct_reference_turns_then_reaches_full_target_on_a_line(self):
         trajectory = MotionTrajectory(self.settings)
         target = np.array([4.,3.,0.])
-        turn = trajectory.sample(0, (0,0,0), target, .15, allow_curve=False)
+        turn = trajectory.generate_reference(0, (0,0,0), target, .15)
         self.assertEqual(turn.kind, 'TURN')
         time = trajectory._duration+.02
-        # A small residual heading error must not turn the drive into an arc.
+        # A small residual heading error is corrected while following the exact straight line.
         pose = (0.,0.,math.atan2(3,4)-.01)
-        drive = trajectory.sample(time, pose, target, .15, allow_curve=False)
+        drive = trajectory.generate_reference(time, pose, target, .15)
         self.assertEqual(drive.kind, 'DRIVE')
         path = trajectory.path()
         np.testing.assert_allclose(path[-1,:2], target[:2], atol=1e-12)
@@ -828,7 +835,7 @@ class ReacquisitionTests(unittest.TestCase):
         trajectory = MotionTrajectory(self.settings)
         target = np.array([.5, 0., 0.])
         for time, pose in ((0., (.5, 0., 1.)), (5., (.7, .1, .8)), (10., (.4, -.1, .5))):
-            reference = trajectory.sample(time, pose, target, 0., turn_only=True)
+            reference = trajectory.generate_reference(time, pose, target, 0., turn_only=True)
             self.assertEqual(reference.kind, 'TURN')
             self.assertEqual(reference.v_mps, 0.)
             np.testing.assert_allclose(trajectory.path()[:, :2], [pose[:2], pose[:2]])

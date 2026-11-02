@@ -57,18 +57,15 @@ def limited_command(time, v, omega) -> VelocityCommand:
     return VelocityCommand(time, v / scale, omega / scale)
 
 
-def lqi_model(speed, turn_rate=0.):
+def lqi_model(speed):
     """Linearise driving in the moving reference axes, then add an error integral.
 
     e = estimated pose - reference pose, rotated into reference heading axes.
     z = [along error, across error, heading error, integral of along error].
-    e_x_dot = omega_ref*e_y + delta_v;
-    e_y_dot = -omega_ref*e_x + v_ref*e_heading.
+    e_x_dot = delta_v; e_y_dot = v_ref*e_heading (straight reference).
     e_heading_dot = delta_omega. The last row integrates e_x.
     """
     A = np.zeros((4, 4))
-    A[0, 1] = turn_rate
-    A[1, 0] = -turn_rate
     A[1, 2] = speed
     A[3, 0] = 1.
     B = np.array([[1., 0.], [0., 0.], [0., 1.], [0., 0.]])
@@ -78,11 +75,22 @@ def lqi_model(speed, turn_rate=0.):
 
 
 @lru_cache(maxsize=256)
-def driving_gain(speed, turn_rate=0.):
-    """Solve the augmented LQR problem once per scheduled reference speed and turn rate."""
-    A, B, Q, R = lqi_model(speed, turn_rate)
+def driving_gain(speed):
+    """Solve the augmented LQR problem once per scheduled reference speed."""
+    A, B, Q, R = lqi_model(speed)
     P = solve_continuous_are(A, B, Q, R)
     return np.linalg.solve(R, B.T @ P)
+
+
+def trajectory_error(pose, reference_pose):
+    """Return estimated minus reference pose: along, across and heading error."""
+    error = np.asarray(pose) - np.asarray(reference_pose)
+    c, s = math.cos(reference_pose[2]), math.sin(reference_pose[2])
+    # Both poses use local odometry. Rotate position error into the reference
+    # heading axes and wrap heading so crossing +/-pi gives a small error.
+    error[:2] = np.array([[c, s], [-s, c]]) @ error[:2]
+    error[2] = wrap_angle(error[2])
+    return error
 
 
 class MotionController:
@@ -139,6 +147,7 @@ class MotionController:
         return limited_command(state.time, v, omega)
 
     def compute_velocity_command(self, state: StateEstimate, request: MotionRequest) -> VelocityCommand:
+        """Select stopped, exploration, PBVS or LQI control for this request."""
         time = float(state.time)
         if not math.isfinite(time) or not math.isclose(time, request.time, rel_tol=0, abs_tol=1e-9):
             raise ValueError('Motion request must match the current estimate timestamp')
@@ -157,6 +166,11 @@ class MotionController:
             if state.dock_pose_local is None:
                 return limited_command(time, 0, 0)
             return self._pbvs_command(state, request)
+        return self._track_trajectory(state, request)
+
+    def _track_trajectory(self, state, request):
+        """Track the timed reference with feedforward velocity minus LQI feedback."""
+        time = float(state.time)
         reference = request.reference
         if reference is None:
             self.reset()
@@ -174,30 +188,34 @@ class MotionController:
             raise ValueError('Controller timestamps must be non-decreasing')
         self._previous_time = time
 
-        # Compare poses in the same fixed local frame, then express position
-        # error along/across the reference heading. Wrap heading across +/-pi.
-        error = np.asarray(state.pose_local) - np.asarray(reference.pose_local)
-        c, s = math.cos(reference.pose_local[2]), math.sin(reference.pose_local[2])
-        error[:2] = np.array([[c, s], [-s, c]]) @ error[:2]
-        error[2] = wrap_angle(error[2])
-        turn_limit = self.settings.turn_speed_rad_s
+        error = trajectory_error(state.pose_local, reference.pose_local)
         if reference.kind == 'TURN':
-            candidate = float(np.clip(self._integral + dt * error[2], -.8, .8))
-            raw = reference.omega_rad_s - self._turn_gain @ [error[2], candidate]
-            # Freeze integration at saturation unless it moves the command back
-            # towards the allowed range. Stops and new segments clear the integral.
-            if abs(raw) <= turn_limit or raw * error[2] > 0:
-                self._integral = candidate
-            omega = reference.omega_rad_s - self._turn_gain @ [error[2], self._integral]
-            return limited_command(time, 0, float(np.clip(omega, -turn_limit, turn_limit)))
+            return self._turn_lqi_command(time, reference, error[2], dt)
+        return self._drive_lqi_command(time, reference, error, dt, request.speed_limit_mps)
 
+    def _turn_lqi_command(self, time, reference, heading_error, dt):
+        """Track heading only during a spot turn; forward velocity stays zero."""
+        turn_limit = self.settings.turn_speed_rad_s
+        candidate = float(np.clip(self._integral + dt * heading_error, -.8, .8))
+        raw = reference.omega_rad_s - self._turn_gain @ [heading_error, candidate]
+        # Freeze integration at saturation unless it moves the command back
+        # towards the allowed range. Stops and new segments clear the integral.
+        if abs(raw) <= turn_limit or raw * heading_error > 0:
+            self._integral = candidate
+        omega = reference.omega_rad_s - self._turn_gain @ [heading_error, self._integral]
+        return limited_command(time, 0, float(np.clip(omega, -turn_limit, turn_limit)))
+
+    def _drive_lqi_command(self, time, reference, error, dt, speed_limit):
+        """Track pose using [along, across, heading, integrated along] error."""
+        turn_limit = self.settings.turn_speed_rad_s
         # At the smooth ramp endpoints v_ref is zero. Use a small signed design
         # speed there; full pose stabilisation at rest is handled by navigation's
         # turn/drive switching, not claimed for this linear model.
         direction = reference.direction
         design_speed = direction * max(.02, round(abs(reference.v_mps), 2))
-        K = driving_gain(design_speed, round(reference.omega_rad_s, 2))
-        speed_limit = min(request.speed_limit_mps, self.settings.dock_speed_mps) if direction < 0 else request.speed_limit_mps
+        K = driving_gain(design_speed)
+        if direction < 0:
+            speed_limit = min(speed_limit, self.settings.dock_speed_mps)
         candidate = float(np.clip(self._integral + dt * error[0], -.15, .15))
         feedforward = np.array([reference.v_mps, reference.omega_rad_s])
         raw = feedforward - K @ np.r_[error, candidate]
