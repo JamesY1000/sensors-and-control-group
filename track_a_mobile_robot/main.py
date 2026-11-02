@@ -25,9 +25,12 @@ import time
 if sys.platform == "linux" and os.environ.get("DISPLAY"):
     os.environ.setdefault("PYGLFW_LIBRARY_VARIANT", "x11")
 
-# Keep the offscreen camera separate from the viewer's GLFW context on Linux.
+# Use the same GL backend as the desktop viewer. Mixing EGL camera contexts
+# with the viewer's GLX context can fail when making the camera current.
+# Backend selection must happen before importing MuJoCo; keep explicit overrides.
 if sys.platform == "linux":
-    os.environ.setdefault("MUJOCO_GL", "egl")
+    headless = "--headless" in sys.argv or not os.environ.get("DISPLAY")
+    os.environ.setdefault("MUJOCO_GL", "egl" if headless else "glfw")
 
 import cv2
 import mujoco

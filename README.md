@@ -22,6 +22,11 @@ The exploration and docking demo starts automatically on launch. Optional
 two simulated seconds; GUI runs continue until closed unless `--seconds` is set.
 On Windows use `python` and activate `.venv\Scripts\Activate.ps1`.
 
+On Linux, desktop runs default to GLFW for both the viewer and camera renderer;
+headless runs default to EGL. An explicit `MUJOCO_GL` setting overrides this
+selection. If a desktop run reports `Failed to make the EGL context current`,
+try `MUJOCO_GL=glfw python3 -m track_a_mobile_robot.main`.
+
 ## Sensor-only acquisition and docking
 
 1. **SCAN / EXPLORE:** send a timed turning command (`search_spin_s`, 20 s).
