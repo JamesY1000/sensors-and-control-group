@@ -11,7 +11,9 @@ from unittest.mock import Mock, patch
 import numpy as np
 import mujoco
 
-from track_a_mobile_robot.control import MotionController, driving_gain, lqi_model, velocity_command_to_wheel_speeds
+from track_a_mobile_robot.control import (
+    MotionController, PIDGains, PIDMotionController, driving_gain, lqi_model, velocity_command_to_wheel_speeds,
+)
 from track_a_mobile_robot.display import OverlayPublisher, SensorDisplay
 from track_a_mobile_robot.estimation import StateEstimate
 from track_a_mobile_robot.navigation import (
@@ -581,6 +583,44 @@ class LQITests(unittest.TestCase):
         self.assertEqual(nav.phase, 'DONE', (pose, nav.status))
         self.assertLessEqual(np.linalg.norm(pose[:2] - [1.7, 0]), .03)
         self.assertLessEqual(abs(pose[2]), math.radians(3))
+
+
+class PIDTests(unittest.TestCase):
+    """The PID comparison baseline must pass the same tracking checks as LQI."""
+
+    def setUp(self):
+        self.settings = navigation_settings()
+        self.controller = PIDMotionController(self.settings)
+
+    request = LQITests.request
+    test_reference_feedforward_and_feedback_signs = LQITests.test_reference_feedforward_and_feedback_signs
+    test_local_frame_does_not_change_command = LQITests.test_local_frame_does_not_change_command
+    test_integral_accumulates_and_stop_clears_it = LQITests.test_integral_accumulates_and_stop_clears_it
+    test_heading_wrap_turn_and_stale_reference = LQITests.test_heading_wrap_turn_and_stale_reference
+    test_hybrid_closed_loop_with_velocity_deadband_and_turn_bias = (
+        LQITests.test_hybrid_closed_loop_with_velocity_deadband_and_turn_bias)
+
+    def test_without_derivative_matches_lqi_on_a_straight_line_at_drive_speed(self):
+        pid = PIDMotionController(self.settings, along=PIDGains(1.73, 1.0), heading=PIDGains(1.94),
+                                  turn=PIDGains(2.83, 2.0))
+        lqi = MotionController(self.settings)
+        for pose in ((.02, 0, 0), (0, .03, 0), (0, 0, .1), (-.01, -.02, .05)):
+            pid.reset(), lqi.reset()
+            for i in range(5):
+                request = MotionRequest(i*.02, 'APPROACH', .3, 1.5, reference=TrajectoryReference(
+                    i*.02, (0, 0, 0), .22, 0., 'DRIVE', 1, 1))
+                a = pid.compute_velocity_command(state(i*.02, pose), request)
+                b = lqi.compute_velocity_command(state(i*.02, pose), request)
+                np.testing.assert_allclose([a.v_mps, a.omega_rad_s], [b.v_mps, b.omega_rad_s], atol=2e-3)
+
+    def test_derivative_has_no_kick_at_segment_start_and_damps_closing_error(self):
+        request = self.request(0, (0, 0, 0), v=0, kind='TURN')
+        first = self.controller.compute_velocity_command(state(0, (0, 0, .2)), request)
+        g = self.controller._turn
+        self.assertAlmostEqual(first.omega_rad_s, -g.kp*.2)
+        # Heading error shrinking towards zero gives a negative rate, which opposes the P term.
+        closing = self.controller.compute_velocity_command(state(.02, (0, 0, .19)), self.request(.02, (0, 0, 0), v=0, kind='TURN'))
+        self.assertGreater(closing.omega_rad_s, -(g.kp*.19 + g.ki*self.controller._integral))
 
 
 class PBVSTests(unittest.TestCase):
