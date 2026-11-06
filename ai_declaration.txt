@@ -11,6 +11,10 @@ James Y:
 - Identified that the chassis collision in the urdf was scraping the floor, causing massive heading errors in odometry
 
 Nikhil K:
-
+- Everything listed below was reviewed and checked by me
+- Claude helped with writing navigation.py and control.py
+- Help in implementing PID for extension
+- Made a script to compare PID with LQI
+- Added a seperate viewer for the LQI vs PID comparison to graph it live
 
 James B:
