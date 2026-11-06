@@ -155,6 +155,52 @@ LQR design (LQI), rather than hand-added PI terms. Bounded integrals and conditi
 integration limit windup; stops, phase changes and new segments clear the integral.
 Search commands remain primitive timed commands until a usable dock estimate exists.
 
+### PID comparison baseline
+
+LQI is the default. `--controller pid` swaps in `PIDMotionController`, which
+replaces only the coarse tracking laws. It keeps the same errors, feedforward,
+saturation, anti-windup and PBVS, so differences come from the feedback alone:
+
+```text
+v     = v_ref     - (kp_x*e_along + ki_x*integral(e_along) + kd_x*d(e_along)/dt)
+omega = omega_ref - (kp_h*e_heading + kd_h*d(e_heading)/dt + k_y*direction*e_across)
+turn: omega = omega_ref - (kp*e_heading + ki*integral(e_heading) + kd*d(e_heading)/dt)
+```
+
+Cross-track error cannot be actuated directly, so it feeds the heading loop and
+changes sign when reversing. Derivatives use a 0.1 s low-pass filter and reset
+with each segment. References are straight lines and spot turns, where the LQI
+gain has no cross-coupling, so the default P/I gains copy `driving_gain(0.22)`
+and the turn gain. The PID run therefore measures the value of LQI's speed
+scheduling of the heading gain, plus the effect of the PID derivative terms.
+
+```bash
+python3 -m track_a_mobile_robot.main --headless --seconds 160 --controller lqi --control-log lqi.csv
+python3 -m track_a_mobile_robot.main --headless --seconds 160 --controller pid --control-log pid.csv
+python3 -m scripts.compare_controllers lqi.csv pid.csv --plot comparison.png
+```
+
+The CSV has one row per control update: tracking errors, commands, limits,
+LiDAR stops and simulator-truth pose. The truth pose is for evaluation only and
+is never fed back into the pipeline. The script prints a metric table and, with
+`--plot`, writes a PNG: driven paths, headline metrics, cross-track and heading
+errors, and v/omega commands against time since each run's first reference.
+Figures are redrawn from the CSVs without re-running the simulations.
+
+To watch a run live, start a viewer in a second terminal. It is a separate process
+that only reads the CSV, so it works with `--headless`, can start before the log
+exists and can be closed at any time. Pass two logs to overlay two runs:
+
+```bash
+python3 -m track_a_mobile_robot.main --controller lqi --control-log lqi.csv
+python3 -m scripts.live_plot lqi.csv
+```
+
+The window shows the driven path and the same error and command plots as the PNG.
+`--window` sets the seconds shown on time plots (default 60; 0 shows the whole run)
+and `--refresh-ms` sets the redraw period (default 1000). Metrics are printed when a
+run docks. Redraws share the CPU, so raise `--refresh-ms` if the simulation slows.
+
 Significant changes in the estimated target or excessive tracking error restart
 the reference from the current estimate. A stop also resets the reference so it
 cannot advance while the robot is held still. Small target corrections are included

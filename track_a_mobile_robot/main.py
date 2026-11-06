@@ -14,6 +14,7 @@ Exploration and docking start automatically when the simulation launches.
 
 import argparse
 from contextlib import nullcontext
+import csv
 from dataclasses import replace
 import math
 import os
@@ -37,8 +38,9 @@ import mujoco
 import numpy as np
 
 from .display import SensorDisplay
-from .control import MotionController, VelocityCommand, velocity_command_to_wheel_speeds
+from .control import MotionController, PIDMotionController, VelocityCommand, velocity_command_to_wheel_speeds
 from .estimation import PoseEstimator, StateEstimate
+from .evaluation import read_true_pose
 from .navigation import Navigator
 from .perception import Perception, PerceptionOutput
 from .scene_config import DEFAULT_CONFIG, EstimationConfig, SceneConfig, load_config
@@ -50,6 +52,16 @@ VIEWER_UPDATE_HZ = 30.0 # Display updates do not need to run at the physics rate
 
 
 SCENE = Path(__file__).resolve().parents[1] / "world/room_with_charger.xml"
+
+CONTROLLERS = {"lqi": MotionController, "pid": PIDMotionController}
+
+# One row per control update for comparing controllers offline. True pose
+# columns are for evaluation only and are never fed back into the pipeline.
+CONTROL_LOG_FIELDS = (
+    "time", "phase", "mode", "reference_kind", "along_error_m", "cross_error_m",
+    "heading_error_rad", "v_mps", "omega_rad_s", "speed_limit_mps", "turn_limit_rad_s",
+    "allowed", "true_x_m", "true_y_m", "true_yaw_rad",
+)
 
 
 def load_spec(path: str | Path = SCENE, config: SceneConfig | None = None) -> mujoco.MjSpec:
@@ -174,6 +186,11 @@ def main() -> None:
     parser.add_argument("--headless", action="store_true", help="Run without a viewer.")
     parser.add_argument("--verbose", action="store_true", help="Include estimated pose, uncertainty and camera counts in logs.")
     parser.add_argument(
+        "--controller", choices=tuple(CONTROLLERS), default="lqi",
+        help="Coarse tracking law; PID is a comparison baseline. PBVS docking is unchanged.",
+    )
+    parser.add_argument("--control-log", type=Path, help="Write one CSV row per control update.")
+    parser.add_argument(
         "--seconds", type=float,
         help="Simulation duration; defaults to 2 s headless, or until the viewer closes.",
     )
@@ -204,13 +221,20 @@ def main() -> None:
 
         viewer_context = viewer.launch_passive(model, data)
 
-    print(f"Sensing and EKF: {config.estimation.update_hz:g} Hz; autonomous docking.", flush=True)
+    print(f"Sensing and EKF: {config.estimation.update_hz:g} Hz; autonomous docking"
+          f" with {args.controller.upper()} tracking.", flush=True)
     print("Odometry starts at marker acquisition. Logs: camera age and simulation speed; --verbose adds pose diagnostics.", flush=True)
-    with viewer_context as window:
+    # Line buffering flushes every row so scripts.live_plot can follow the log.
+    log_context = nullcontext(None) if args.control_log is None else open(args.control_log, "w", newline="", buffering=1)
+    with viewer_context as window, log_context as log_file:
+        control_log = None
+        if log_file is not None:
+            control_log = csv.writer(log_file)
+            control_log.writerow(CONTROL_LOG_FIELDS)
         # Create these once so each update uses the previous estimate and sensor history.
         estimator, perception, encoder_rng = create_demo(model, config.estimation)
         navigator = Navigator(config.navigation)
-        controller = MotionController(config.navigation)
+        controller = CONTROLLERS[args.controller](config.navigation)
         wheel_ids = [model.actuator(name).id for name in ("wheel_left", "wheel_right")]
         wheel_commands = (0.0, 0.0)
         display = SensorDisplay() if window is not None else None
@@ -267,6 +291,8 @@ def main() -> None:
                     # velocities from the EKF's relative dock pose, without a reference.
                     request = navigator.motion_request(estimate, output)
                     command = controller.compute_velocity_command(estimate, request)
+                    # Read the error now; a LiDAR stop below resets the controller.
+                    tracking_error = controller.tracking_error if request.reference is not None else None
                     # Check the actual commanded arc against the latest LiDAR.
                     # Navigation chooses detours; this final check can still stop them.
                     allowed = navigator.allow_motion(request, command.v_mps, command.omega_rad_s, output)
@@ -274,6 +300,16 @@ def main() -> None:
                         controller.reset()
                         command = VelocityCommand(estimate.time, 0.0, 0.0)
                     wheel_commands = velocity_command_to_wheel_speeds(command)
+                    if control_log is not None:
+                        reference = request.reference
+                        error = tracking_error if tracking_error is not None else ("", "", "")
+                        control_log.writerow((
+                            f"{estimate.time:.3f}", navigator.phase, request.mode,
+                            reference.kind if reference is not None else "",
+                            *error, command.v_mps, command.omega_rad_s,
+                            request.speed_limit_mps, config.navigation.turn_speed_rad_s,
+                            int(allowed), *read_true_pose(data),
+                        ))
 
                     # Display the same camera image used by perception, with its detections.
                     if window is not None:
