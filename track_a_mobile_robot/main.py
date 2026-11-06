@@ -40,7 +40,7 @@ from .display import SensorDisplay
 from .control import MotionController, VelocityCommand, velocity_command_to_wheel_speeds
 from .estimation import PoseEstimator, StateEstimate
 from .navigation import Navigator
-from .perception import Perception, PerceptionOutput
+from .perception import Perception, PerceptionOutput, SensorNoise
 from .scene_config import DEFAULT_CONFIG, EstimationConfig, SceneConfig, load_config
 from .sensing import read_noisy_wheel_encoders
 from .state_model import DifferentialDriveModel
@@ -106,8 +106,15 @@ def load_model(path: str | Path = SCENE, config: SceneConfig | None = None) -> m
 def create_demo(
     model: mujoco.MjModel,
     settings: EstimationConfig,
+    noise: SensorNoise | None = None,
+    lens_calibrated: bool = True,
 ) -> tuple[PoseEstimator, Perception, np.random.Generator]:
-    """Create the estimator, perception and encoder noise generator once per run."""
+    """Create the estimator, perception and encoder noise generator once per run.
+
+    noise: camera and LiDAR noise preset (default: the original nominal noise).
+    lens_calibrated: if True, the detector is given the simulated lens distortion,
+    standing in for a calibrated camera; if False, it assumes an ideal lens.
+    """
 
     # Additional motion-model uncertainty, expressed per square root of a second.
     # Squaring these values gives the process covariance added per second.
@@ -131,7 +138,11 @@ def create_demo(
     # Separate streams keep encoder noise independent of camera/LiDAR sampling.
     encoder_seed, perception_seed = np.random.SeedSequence(settings.noise_seed).spawn(2)
     encoder_rng = np.random.default_rng(encoder_seed)
-    perception = Perception(model, noise=True, rng=np.random.default_rng(perception_seed))
+    noise = SensorNoise.nominal() if noise is None else noise
+    perception = Perception(
+        model, noise=noise, rng=np.random.default_rng(perception_seed),
+        dist_coeffs=np.asarray(noise.camera_distortion) if lens_calibrated else None,
+    )
     return estimator, perception, encoder_rng
 
 
@@ -177,6 +188,14 @@ def main() -> None:
         "--seconds", type=float,
         help="Simulation duration; defaults to 2 s headless, or until the viewer closes.",
     )
+    parser.add_argument(
+        "--noise", choices=("ideal", "nominal", "realistic", "harsh"), default="nominal",
+        help="Camera and LiDAR noise preset (default: nominal, the original demo noise).",
+    )
+    parser.add_argument(
+        "--uncalibrated-lens", action="store_true",
+        help="Detector assumes an ideal lens even when the preset distorts the image.",
+    )
     args = parser.parse_args()
     if args.seconds is not None and (not math.isfinite(args.seconds) or args.seconds <= 0):
         parser.error("--seconds must be positive and finite")
@@ -204,11 +223,16 @@ def main() -> None:
 
         viewer_context = viewer.launch_passive(model, data)
 
+    noise = SensorNoise.preset(args.noise)
+    lens_calibrated = not args.uncalibrated_lens
     print(f"Sensing and EKF: {config.estimation.update_hz:g} Hz; autonomous docking.", flush=True)
+    print(f"Sensor noise: {args.noise}"
+          + ("; lens distortion NOT corrected" if not lens_calibrated and any(noise.camera_distortion) else ""),
+          flush=True)
     print("Odometry starts at marker acquisition. Logs: camera age and simulation speed; --verbose adds pose diagnostics.", flush=True)
     with viewer_context as window:
         # Create these once so each update uses the previous estimate and sensor history.
-        estimator, perception, encoder_rng = create_demo(model, config.estimation)
+        estimator, perception, encoder_rng = create_demo(model, config.estimation, noise, lens_calibrated)
         navigator = Navigator(config.navigation)
         controller = MotionController(config.navigation)
         wheel_ids = [model.actuator(name).id for name in ("wheel_left", "wheel_right")]
@@ -233,7 +257,7 @@ def main() -> None:
                 # Viewer reset starts a new estimate and clears cached sensor samples.
                 if now < last_physics_time:
                     perception.close()
-                    estimator, perception, encoder_rng = create_demo(model, config.estimation)
+                    estimator, perception, encoder_rng = create_demo(model, config.estimation, noise, lens_calibrated)
                     navigator = Navigator(config.navigation)
                     controller.reset()
                     wheel_commands = (0.0, 0.0)
