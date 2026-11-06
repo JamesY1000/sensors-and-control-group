@@ -21,19 +21,16 @@ from track_a_mobile_robot.main import load_spec
 from track_a_mobile_robot.perception import (
     MARKER_SIZES_M,
     ArucoLandmarkDetector,
-    _fixed_body_transform,
+    MarkerObservation,
     add_camera_noise,
     add_lidar_noise,
     invert_transform,
     lidar_points_in_base,
-    lidar_points_to_world,
+    lidar_points_to_local,
     lidar_transform_from_model,
     make_transform,
-    marker_map_from_model,
     pose_to_transform,
-    robot_pose_from_marker,
     transform_to_pose,
-    wrap_angle,
 )
 from track_a_mobile_robot.scene_config import DEFAULT_CONFIG, SceneConfig, load_config
 from track_a_mobile_robot.sensing import (
@@ -44,11 +41,70 @@ from track_a_mobile_robot.sensing import (
     RGBCamera,
     read_lidar,
 )
+from track_a_mobile_robot.state_model import wrap_angle
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = REPO_ROOT / "outputs" / "perception"
 MARKER_DIR = REPO_ROOT / "world" / "assets"
+
+
+# --- Evaluation-only truth helpers ---------------------------------------------------
+# Runtime perception deliberately has no marker map or world poses (see README),
+# so these helpers live here, next to the other code that reads simulator truth.
+
+def _fixed_body_transform(model: mujoco.MjModel, body_id: int) -> np.ndarray:
+    """World transform of a body, chained through its parents' fixed poses.
+
+    Valid for bodies whose ancestors have no joints (the dock, furniture).
+    Needs only the compiled model, so no simulation state is created.
+    """
+    transform = np.eye(4)
+    while body_id != 0:
+        rotation = np.empty(9)
+        mujoco.mju_quat2Mat(rotation, model.body_quat[body_id])
+        transform = make_transform(rotation, model.body_pos[body_id]) @ transform
+        body_id = int(model.body_parentid[body_id])
+    return transform
+
+
+def marker_map_from_model(model: mujoco.MjModel) -> dict[int, np.ndarray]:
+    """TRUE world pose of each marker, from the hidden aruco_marker_<id> sites.
+
+    The sites use OpenCV's ArUco axes (x right, y up, z out of the face), so these
+    transforms can be compared directly with T_camera_marker from the detector.
+    """
+    markers = {}
+    for marker_id in MARKER_SIZES_M:
+        name = f"aruco_marker_{marker_id}"
+        site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, name)
+        if site_id < 0:
+            continue
+        rotation = np.empty(9)
+        mujoco.mju_quat2Mat(rotation, model.site_quat[site_id])
+        T_body_site = make_transform(rotation, model.site_pos[site_id])
+        markers[marker_id] = _fixed_body_transform(model, int(model.site_bodyid[site_id])) @ T_body_site
+    if not markers:
+        raise ValueError("Scene has no aruco_marker_<id> sites for evaluation")
+    return markers
+
+
+def robot_pose_from_marker(observation: MarkerObservation,
+                           marker_map: dict[int, np.ndarray]) -> np.ndarray | None:
+    """Robot [x, y, heading] in the world from one marker and its TRUE world pose.
+
+    T_world_base = T_world_marker @ inverse(T_base_marker). Evaluation only: it
+    scores the full marker pose, including the orientation affected by planar ambiguity.
+    """
+    T_world_marker = marker_map.get(observation.marker_id)
+    if T_world_marker is None:
+        return None
+    return transform_to_pose(T_world_marker @ invert_transform(observation.T_base_marker))
+
+
+def lidar_points_to_world(points_base: np.ndarray, pose) -> np.ndarray:
+    """Place base-frame points in the world using a pose (here, the TRUE pose)."""
+    return lidar_points_to_local(points_base, pose)
 
 
 # Robot test poses in the station frame: x points out of the dock, yaw pi
@@ -379,12 +435,13 @@ def check_extrinsic(camera_matrix, dist_coeffs, config: SceneConfig | None = Non
     # Identity extrinsic, so T_base_marker below is really T_camera_marker.
     detector = ArucoLandmarkDetector(camera_matrix, dist_coeffs, np.eye(4))
     camera = _InstantCamera(model)
-    # Close and oblique, which keeps the planar ambiguity small.
+    # As close as the 0.40 m marker stays fully in view (about 1.4 m), and oblique,
+    # which keeps the planar ambiguity small. Closer, the marker leaves the image.
     rig_poses = _station_test_poses(model, [
-        (0.9, -0.25, np.pi - 0.35), (0.9, 0.25, np.pi + 0.35),
-        (1.0, -0.1, np.pi - 0.2), (1.0, 0.1, np.pi + 0.2),
-        (0.7, -0.2, np.pi - 0.45), (0.7, 0.2, np.pi + 0.45),
-        (1.1, 0.0, np.pi), (0.8, 0.0, np.pi + 0.15),
+        (1.5, -0.3, np.pi - 0.3), (1.5, 0.3, np.pi + 0.3),
+        (1.6, -0.15, np.pi - 0.15), (1.6, 0.15, np.pi + 0.15),
+        (1.8, -0.4, np.pi - 0.35), (1.8, 0.4, np.pi + 0.35),
+        (1.5, 0.0, np.pi), (2.0, 0.2, np.pi + 0.1),
     ])
     estimates = []
     for pose in rig_poses:
