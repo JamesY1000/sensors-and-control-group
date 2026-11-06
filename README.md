@@ -187,6 +187,20 @@ is never fed back into the pipeline. The script prints a metric table and, with
 errors, and v/omega commands against time since each run's first reference.
 Figures are redrawn from the CSVs without re-running the simulations.
 
+To watch a run live, start a viewer in a second terminal. It is a separate process
+that only reads the CSV, so it works with `--headless`, can start before the log
+exists and can be closed at any time. Pass two logs to overlay two runs:
+
+```bash
+python3 -m track_a_mobile_robot.main --controller lqi --control-log lqi.csv
+python3 -m scripts.live_plot lqi.csv
+```
+
+The window shows the driven path and the same error and command plots as the PNG.
+`--window` sets the seconds shown on time plots (default 60; 0 shows the whole run)
+and `--refresh-ms` sets the redraw period (default 1000). Metrics are printed when a
+run docks. Redraws share the CPU, so raise `--refresh-ms` if the simulation slows.
+
 Significant changes in the estimated target or excessive tracking error restart
 the reference from the current estimate. A stop also resets the reference so it
 cannot advance while the robot is held still. Small target corrections are included

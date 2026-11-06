@@ -224,7 +224,8 @@ def main() -> None:
     print(f"Sensing and EKF: {config.estimation.update_hz:g} Hz; autonomous docking"
           f" with {args.controller.upper()} tracking.", flush=True)
     print("Odometry starts at marker acquisition. Logs: camera age and simulation speed; --verbose adds pose diagnostics.", flush=True)
-    log_context = nullcontext(None) if args.control_log is None else open(args.control_log, "w", newline="")
+    # Line buffering flushes every row so scripts.live_plot can follow the log.
+    log_context = nullcontext(None) if args.control_log is None else open(args.control_log, "w", newline="", buffering=1)
     with viewer_context as window, log_context as log_file:
         control_log = None
         if log_file is not None:
