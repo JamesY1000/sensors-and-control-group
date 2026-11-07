@@ -29,6 +29,11 @@ Headless mode defaults to two simulated seconds. `--verbose` adds pose diagnosti
 noise, update rates and navigation settings. Restart after changing the file.
 The default scene is an 8 × 6 m room with tables, chairs and a two-marker dock.
 
+On Linux, desktop runs default to GLFW for both the viewer and camera renderer;
+headless runs default to EGL. An explicit `MUJOCO_GL` setting overrides this
+selection. If a desktop run reports `Failed to make the EGL context current`,
+try `MUJOCO_GL=glfw python -m track_a_mobile_robot.main`.
+
 The simulation progresses through SCAN/EXPLORE, LQI APPROACH (with obstacle
 boundary following when needed), REACQUIRE, PBVS ALIGN, DOCK and DONE.
 REACQUIRE requires recent accepted camera poses before PBVS begins. Once in

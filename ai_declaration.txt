@@ -15,6 +15,10 @@ James Y:
 - Helped with creating hardware tests, and helping resolve issues such as the msg timing/polling delays due to turtlebot hardware limitations
 
 Nikhil K:
-
+- Everything listed below was reviewed and checked by me
+- Claude helped with writing navigation.py and control.py
+- Help in implementing PID for extension
+- Made a script to compare PID with LQI
+- Added a seperate viewer for the LQI vs PID comparison to graph it live
 
 James B:

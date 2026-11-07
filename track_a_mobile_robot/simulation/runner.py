@@ -77,7 +77,10 @@ def run_simulation(*, config_path=None, seconds=None, headless=False, verbose=Fa
     if sys.platform == "linux" and os.environ.get("DISPLAY"):
         os.environ.setdefault("PYGLFW_LIBRARY_VARIANT", "x11")
     if sys.platform == "linux":
-        os.environ.setdefault("MUJOCO_GL", "egl")
+        # Match the desktop viewer's GL backend to avoid camera context conflicts.
+        # Select before importing MuJoCo, while preserving explicit overrides.
+        use_egl = headless or not os.environ.get("DISPLAY")
+        os.environ.setdefault("MUJOCO_GL", "egl" if use_egl else "glfw")
     import mujoco
 
     from .display import SensorDisplay
