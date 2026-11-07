@@ -2,6 +2,8 @@
 
 **Group 26 — Track A: Autonomous navigation and docking of a TurtleBot**
 
+[Youtube link to project video](https://youtu.be/kL1oBgwSmRY)
+
 Autonomous TurtleBot3 docking in MuJoCo and on a real Waffle Pi. Both demos use
 camera/LiDAR perception, an encoder/camera EKF, LQI navigation and PBVS docking.
 The robot starts without a known world pose or dock location. The first accepted
