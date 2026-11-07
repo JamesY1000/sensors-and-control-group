@@ -21,6 +21,13 @@ marker establishes a local odometry frame; later observations correct that estim
 
 ## Run the simulation
 
+![Simulated docking with ArUco detections, the latest LiDAR scan and navigation state](docs/images/simulation-docking.png)
+
+The simulation shows the robot alongside its RGB camera detections and latest
+2D LiDAR scan. LQI tracks the approach trajectory; PBVS adjusts position and
+heading during final docking. The LiDAR panel displays current returns from
+the room and obstacles, rather than a persistent map.
+
 Use Python 3.12 or newer from the repository root:
 
 ```bash
@@ -55,6 +62,14 @@ ALIGN/DOCK, the simulation can continue on encoder prediction during marker
 occlusion; completion uses estimated pose tolerances. LiDAR stops remain active.
 
 ## Log and evaluate a baseline simulation
+
+![Baseline position-estimation error against simulator truth and LQI cross-track RMSE](docs/images/baseline-evaluation.png)
+
+In the illustrated baseline run, position-estimation RMSE was **6.47 cm**.
+The actual cross-track RMSE was **2.26 cm**, compared with **0.21 cm** measured
+using the estimated pose. This distinction matters: a small feedback error
+does not necessarily mean the true robot pose is equally close to the reference.
+These are single-run results; the comparison table below averages repeated trials.
 
 The existing demo uses EKF estimation and LQI/PBVS control. Log the whole run
 without screen recording; `--stop-on-dock` stops after saving the first DONE
@@ -145,6 +160,13 @@ and tracking errors for LQI, while final docking errors remained close to the
 shared PBVS stopping boundary. Three seeds expose variability but do not
 establish statistically significant superiority of either tracker.
 
+![Nominal versus fivefold encoder noise: position-error traces and three-trial average estimation and tracking errors](docs/images/encoder-noise-comparison.png)
+
+The traces show one matched pair of LQI runs; the figures on the right average
+three trials per noise condition. All six LQI runs reached DONE, but only one
+met the true 3 cm / 3 degree docking tolerance. The PID trials are included
+separately in the table above.
+
 The six LQI logs were also replayed through both filters, using exactly the same
 inputs. EKF replay reproduced every recorded pose, covariance and camera-gating
 decision. Mean position RMSE was 6.805 cm (EKF) versus 6.809 cm (UKF) for nominal
@@ -164,10 +186,18 @@ the saved trial table retains every individual result.
 
 ## Run the hardware demo
 
+![Three real TurtleBot docking trials, with initial positions above and final docking positions below](docs/images/hardware-docking-trials.png)
+
+Three recorded hardware runs demonstrate docking from different starting poses.
+Each column pairs a starting position with the final docking position. The robot
+uses LQI for the approach and PBVS for final docking; obstacle avoidance was not
+tested in these hardware recordings.
+
 Initialise the dependency submodule on a fresh checkout, then install into an
 activated Python environment:
 
 ```bash
+git submodule sync --recursive
 git submodule update --init --recursive
 python -m pip install -r requirements-hardware.txt
 python -m pip install --no-deps -e extern/turtlebot_rosbridge

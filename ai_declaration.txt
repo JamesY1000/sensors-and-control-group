@@ -28,3 +28,7 @@ Nikhil K:
 - Added a seperate viewer for the LQI vs PID comparison to graph it live
 
 James B:
+- Helped with inital reading of LiDAR sensor from Mujoco
+- Helped with the modified camera overlay
+- Helped with the integration of the simulated camera aruco detections with required format of estimation module
+- Helped with the integration of LiDAR scan points with the obstacle detection

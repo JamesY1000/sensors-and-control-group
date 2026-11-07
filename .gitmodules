@@ -1,3 +1,3 @@
 [submodule "extern/turtlebot_rosbridge"]
 	path = extern/turtlebot_rosbridge
-	url = git@github.com:JamesY1000/turtlebot_rosbridge.git
+	url = https://github.com/JamesY1000/turtlebot_rosbridge.git
