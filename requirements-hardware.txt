@@ -1,0 +1,5 @@
+numpy==2.5.4
+scipy==1.18.0
+opencv-contrib-python==4.14.0.94
+PyYAML==6.0.3
+roslibpy>=2.0,<3

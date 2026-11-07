@@ -219,7 +219,7 @@ class MotionRequest:
         return self.mode == 'STOP'
 
     def __post_init__(self) -> None:
-        if self.mode not in ('STOP', 'SCAN', 'EXPLORE', 'APPROACH', 'AVOID', 'REACQUIRE', 'ALIGN', 'DOCK'):
+        if self.mode not in ('STOP', 'SCAN', 'EXPLORE', 'APPROACH', 'AVOID', 'REACQUIRE', 'ALIGN', 'DOCK', 'NAVIGATE'):
             raise ValueError('Unknown motion mode')
         if not all(math.isfinite(v) for v in (self.time, self.speed_limit_mps, self.turn_rate_rad_s)):
             raise ValueError('Motion request values must be finite')
@@ -469,7 +469,7 @@ class Navigator:
     def _observe_dock(self, time, perception):
         """Remember distinct EKF-accepted frames, including just before handover.
 
-        main.update_demo removes rejected measurements before calling navigation.
+        The runners remove rejected measurements before calling navigation.
         Camera frames arrive more slowly than control ticks; missing a new frame
         on one tick must not erase otherwise recent confirmation evidence.
         """
@@ -549,8 +549,8 @@ class Navigator:
     def trajectory_path(self):
         return self._trajectory.path()
 
-    def _tracking_request(self, state, offset, speed, perception, target=None):
-        direct = self.phase == 'APPROACH'
+    def _tracking_request(self, state, offset, speed, perception, target=None, *, direct=None):
+        direct = self.phase == 'APPROACH' if direct is None else direct
         target = dock_target_pose(state.dock_pose_local, offset) if target is None else target
         if perception.lidar.time != self._path_scan_time:
             self._path_scan_time = perception.lidar.time
@@ -733,7 +733,7 @@ class Navigator:
         if request.mode == 'EXPLORE':
             self.phase = 'SCAN'
             self._search_remaining = self.settings.search_spin_s
-        if request.mode in ('APPROACH', 'AVOID'):
+        if request.mode in ('APPROACH', 'AVOID', 'NAVIGATE'):
             self._motion_blocked = True
             self._detour.target = None
         self.status = 'Motion blocked by LiDAR; waiting for a clear command'

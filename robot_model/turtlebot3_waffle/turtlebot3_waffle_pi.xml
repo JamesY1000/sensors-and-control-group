@@ -83,7 +83,7 @@
     <velocity class="wheel_right" name="wheel_right" joint="wheel_right"/>
   </actuator>
 
-  <!-- Wheel encoder angles in radians. Store std (in rads) foruse by sensing.py -->
+  <!-- Wheel encoder angles in radians. Noise std is sampled by hal/mujoco.py. -->
   <sensor>
     <jointpos name="wheel_left_encoder" joint="wheel_left" noise="0.01"/>
     <jointpos name="wheel_right_encoder" joint="wheel_right" noise="0.01"/>

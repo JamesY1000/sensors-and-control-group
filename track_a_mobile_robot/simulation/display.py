@@ -7,7 +7,7 @@ import queue
 import threading
 from collections import deque
 
-from .perception import lidar_points_to_local
+from ..perception import lidar_points_to_local
 
 
 class OverlayPublisher:

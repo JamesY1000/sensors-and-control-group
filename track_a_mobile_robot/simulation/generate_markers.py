@@ -1,4 +1,4 @@
-"""Regenerate both dock marker textures: python -m scripts.generate_marker."""
+"""Regenerate both dock marker textures: python -m track_a_mobile_robot.simulation.generate_markers."""
 
 from pathlib import Path
 
@@ -8,7 +8,7 @@ import numpy as np
 
 def main() -> None:
     dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-    output_dir = Path(__file__).resolve().parents[1] / "world" / "assets"
+    output_dir = Path(__file__).resolve().parents[2] / "world" / "assets"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Match the black-square / panel ratios in world/charging_station.xml:

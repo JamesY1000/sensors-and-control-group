@@ -44,6 +44,16 @@ from .state_model import DifferentialDriveModel, wrap_angle
 CAMERA_INNOVATION_LIMIT = 11.345 # 99% chi-squared threshold, three components
 
 
+def create_estimator(settings, model, encoder_noise_std_rad, *, gate_camera=True):
+    """Construct the shared EKF from update settings and encoder calibration."""
+    process_std = np.array([
+        settings.process_position_std_m_per_sqrt_s,
+        settings.process_position_std_m_per_sqrt_s,
+        np.deg2rad(settings.process_heading_std_deg_per_sqrt_s),
+    ])
+    return PoseEstimator(model, encoder_noise_std_rad, np.diag(process_std**2), gate_camera=gate_camera)
+
+
 @dataclass(frozen=True)
 class StateEstimate:
     """Store a snapshot for navigation and control, separate from the EKF's working state.
@@ -101,9 +111,10 @@ class PoseEstimator:
     """EKF for encoder motion and camera observations of one unknown rigid dock."""
 
     def __init__(self, model: DifferentialDriveModel, encoder_noise_std_rad,
-                 process_noise_covariance_per_s: np.ndarray) -> None:
+                 process_noise_covariance_per_s: np.ndarray, *, gate_camera=True) -> None:
         # Store the motion model and noise assumptions used in prediction.
         self._model = model
+        self._gate_camera = gate_camera
         self._encoder_noise_std_rad = np.asarray(encoder_noise_std_rad, dtype=float)
         self._process_noise_covariance_per_s = np.array(process_noise_covariance_per_s, copy=True)
         # The first three states belong to the robot; the last three belong to the dock.
@@ -211,7 +222,7 @@ class PoseEstimator:
         self.camera_correction_accepted = False
         # Gate using the normalised innovation, not a fixed distance/angle threshold.
         # A large disagreement relative to S leaves the predicted state and P unchanged.
-        if float(innovation @ np.linalg.solve(S, innovation)) > CAMERA_INNOVATION_LIMIT:
+        if self._gate_camera and float(innovation @ np.linalg.solve(S, innovation)) > CAMERA_INNOVATION_LIMIT:
             return self._estimate(time)
         # Kalman gain K = P @ H.T @ inv(S), computed with a solve instead of an inverse.
         # Shared uncertainty allows this relative observation to update robot and dock.

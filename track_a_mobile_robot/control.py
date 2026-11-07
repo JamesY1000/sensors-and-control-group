@@ -22,9 +22,9 @@ using the encoder/camera estimate, never simulator poses. Navigation checks
 LiDAR clearance before commands are applied.
 """
 
+import math
 from dataclasses import dataclass
 from functools import lru_cache
-import math
 
 import numpy as np
 from scipy.linalg import solve_continuous_are
@@ -34,9 +34,27 @@ from .navigation import MotionRequest, dock_target_pose
 from .scene_config import NavigationConfig
 from .state_model import wrap_angle
 
-_WHEEL_RADIUS_M = .033
-_WHEEL_TRACK_M = .288
-_MAX_WHEEL_SPEED_RAD_S = 7.88
+
+@dataclass(frozen=True)
+class DriveConfig:
+    """Wheel geometry and limits; defaults preserve the simulation tuning."""
+
+    wheel_radius_m: float = .033
+    wheel_separation_m: float = .288
+    max_wheel_speed_rad_s: float = 7.88
+    pbvs_min_speed_mps: float = .04
+    pbvs_min_turn_rad_s: float = .30
+
+    def __post_init__(self):
+        for name in ('wheel_radius_m', 'wheel_separation_m', 'max_wheel_speed_rad_s'):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                raise ValueError(f'{name} must be positive and finite')
+        for name in ('pbvs_min_speed_mps', 'pbvs_min_turn_rad_s'):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
+                raise ValueError(f'{name} must be non-negative and finite')
+
+
+DEFAULT_DRIVE = DriveConfig()
 
 
 @dataclass(frozen=True)
@@ -48,12 +66,13 @@ class VelocityCommand:
     omega_rad_s: float
 
 
-def limited_command(time, v, omega) -> VelocityCommand:
+def limited_command(time, v, omega, drive: DriveConfig = DEFAULT_DRIVE) -> VelocityCommand:
     """Scale both velocities together to respect wheel speed limits."""
     if not all(math.isfinite(value) for value in (time, v, omega)):
         raise ValueError('Command values must be finite')
-    peak = max(abs(v - omega * _WHEEL_TRACK_M / 2), abs(v + omega * _WHEEL_TRACK_M / 2)) / _WHEEL_RADIUS_M
-    scale = max(1.0, peak / _MAX_WHEEL_SPEED_RAD_S)
+    peak = max(abs(v - omega * drive.wheel_separation_m / 2),
+               abs(v + omega * drive.wheel_separation_m / 2)) / drive.wheel_radius_m
+    scale = max(1.0, peak / drive.max_wheel_speed_rad_s)
     return VelocityCommand(time, v / scale, omega / scale)
 
 
@@ -96,8 +115,9 @@ def trajectory_error(pose, reference_pose):
 class MotionController:
     """LQI coarse tracking and planar PBVS alignment/docking, with shared limits."""
 
-    def __init__(self, settings: NavigationConfig) -> None:
+    def __init__(self, settings: NavigationConfig, drive: DriveConfig = DEFAULT_DRIVE) -> None:
         self.settings = settings
+        self.drive = drive
         # In-place turns cannot control x/y. Design LQI only for heading and its
         # integral instead of solving an uncontrollable stationary pose problem.
         A = np.array([[0., 0.], [1., 0.]])
@@ -111,6 +131,9 @@ class MotionController:
         self._integral = 0.
         self._previous_time = None
         self._segment = None
+
+    def _limited_command(self, time, v, omega):
+        return limited_command(time, v, omega, self.drive)
 
     def _pbvs_command(self, state, request):
         """Servo the estimated robot-relative target pose using differential-drive motion.
@@ -126,11 +149,11 @@ class MotionController:
         limit = self.settings.turn_speed_rad_s
         if rho <= self.settings.position_tolerance_m:
             # Translation is settled; finish the heading without driving sideways.
-            # Wheel friction creates an in-place turn deadband of about 0.23 rad/s
-            # in this model. Use 0.30 outside tolerance so alignment does not stall.
+            # The simulation's default floor overcomes its wheel friction.
+            # Hardware supplies its own measured minimum speeds (zero initially).
             omega = (0. if abs(yaw) <= math.radians(self.settings.heading_tolerance_deg)
-                     else math.copysign(max(.30, 1.5*abs(yaw)), yaw))
-            return limited_command(state.time, 0., float(np.clip(omega, -limit, limit)))
+                     else math.copysign(max(self.drive.pbvs_min_turn_rad_s, 1.5*abs(yaw)), yaw))
+            return self._limited_command(state.time, 0., float(np.clip(omega, -limit, limit)))
         alpha = math.atan2(target[1], target[0])
         direction = 1
         if abs(alpha) > math.pi/2 and abs(yaw) < math.pi/4:
@@ -142,9 +165,9 @@ class MotionController:
         # Turn first for a large bearing error. The robot cannot translate laterally.
         # Keep enough wheel speed to overcome low-speed friction outside tolerance;
         # otherwise proportional feedback can stall just short of the offset.
-        speed = min(request.speed_limit_mps, max(.04, .6*rho))
+        speed = min(request.speed_limit_mps, max(self.drive.pbvs_min_speed_mps, .6*rho))
         v = direction*speed*max(0., math.cos(alpha)) if abs(alpha) < math.pi/3 else 0.
-        return limited_command(state.time, v, omega)
+        return self._limited_command(state.time, v, omega)
 
     def compute_velocity_command(self, state: StateEstimate, request: MotionRequest) -> VelocityCommand:
         """Select stopped, exploration, PBVS or LQI control for this request."""
@@ -153,18 +176,18 @@ class MotionController:
             raise ValueError('Motion request must match the current estimate timestamp')
         if request.stop_requested:
             self.reset()
-            return limited_command(time, 0, 0)
+            return self._limited_command(time, 0, 0)
         if request.mode in ('SCAN', 'EXPLORE'):
             # Before acquisition there is no pose feedback: just bounded velocity
             # commands converted to wheel speeds. Navigation still checks LiDAR.
             self.reset()
-            return limited_command(time, min(request.speed_limit_mps, self.settings.drive_speed_mps),
+            return self._limited_command(time, min(request.speed_limit_mps, self.settings.drive_speed_mps),
                                    float(np.clip(request.turn_rate_rad_s,
                                                  -self.settings.turn_speed_rad_s, self.settings.turn_speed_rad_s)))
         if request.visual_servo:
             self.reset()  # Do not carry the LQI integral into a different control law.
             if state.dock_pose_local is None:
-                return limited_command(time, 0, 0)
+                return self._limited_command(time, 0, 0)
             return self._pbvs_command(state, request)
         return self._track_trajectory(state, request)
 
@@ -174,7 +197,7 @@ class MotionController:
         reference = request.reference
         if reference is None:
             self.reset()
-            return limited_command(time, 0, 0)
+            return self._limited_command(time, 0, 0)
         if not np.isfinite(state.pose_local).all():
             raise ValueError('Tracking requires a finite estimated pose')
         if not math.isclose(reference.time, time, rel_tol=0, abs_tol=1e-9):
@@ -203,7 +226,7 @@ class MotionController:
         if abs(raw) <= turn_limit or raw * heading_error > 0:
             self._integral = candidate
         omega = reference.omega_rad_s - self._turn_gain @ [heading_error, self._integral]
-        return limited_command(time, 0, float(np.clip(omega, -turn_limit, turn_limit)))
+        return self._limited_command(time, 0, float(np.clip(omega, -turn_limit, turn_limit)))
 
     def _drive_lqi_command(self, time, reference, error, dt, speed_limit):
         """Track pose using [along, across, heading, integrated along] error."""
@@ -222,16 +245,29 @@ class MotionController:
         if abs(raw[0]) <= speed_limit or raw[0] * error[0] > 0:
             self._integral = candidate
         velocity = feedforward - K @ np.r_[error, self._integral]
-        return limited_command(time, float(np.clip(velocity[0], -speed_limit, speed_limit)),
+        return self._limited_command(time, float(np.clip(velocity[0], -speed_limit, speed_limit)),
                                float(np.clip(velocity[1], -turn_limit, turn_limit)))
 
 
-def velocity_command_to_wheel_speeds(command: VelocityCommand) -> tuple[float, float]:
+def velocity_command_to_wheel_speeds(
+    command: VelocityCommand, drive: DriveConfig = DEFAULT_DRIVE,
+) -> tuple[float, float]:
     """Convert the limited planar command into wheel angular velocities (rad/s)."""
-    left = (command.v_mps - command.omega_rad_s * _WHEEL_TRACK_M / 2) / _WHEEL_RADIUS_M
-    right = (command.v_mps + command.omega_rad_s * _WHEEL_TRACK_M / 2) / _WHEEL_RADIUS_M
+    left = (command.v_mps - command.omega_rad_s * drive.wheel_separation_m / 2) / drive.wheel_radius_m
+    right = (command.v_mps + command.omega_rad_s * drive.wheel_separation_m / 2) / drive.wheel_radius_m
     if not all(math.isfinite(value) for value in (left, right)):
         raise ValueError('Wheel speeds must be finite')
-    if max(abs(left), abs(right)) > _MAX_WHEEL_SPEED_RAD_S + 1e-9:
+    if max(abs(left), abs(right)) > drive.max_wheel_speed_rad_s + 1e-9:
         raise ValueError('Wheel speeds exceed their limits')
     return left, right
+
+
+def navigation_command(navigator, controller, estimate, output, *, stop_requested=False):
+    """Choose behaviour, compute velocity, and check the actual commanded arc."""
+    request = navigator.motion_request(estimate, output, stop_requested=stop_requested)
+    command = controller.compute_velocity_command(estimate, request)
+    allowed = navigator.allow_motion(request, command.v_mps, command.omega_rad_s, output)
+    if not allowed:
+        controller.reset()
+        command = VelocityCommand(estimate.time, 0., 0.)
+    return request, command, allowed

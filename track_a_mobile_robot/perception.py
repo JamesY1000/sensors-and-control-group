@@ -29,15 +29,15 @@ Marker sizes and mounting offsets are physical calibration, not world locations.
 For transforms below, T_a_b maps coordinates from frame b into frame a.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 import cv2
-import mujoco
 import numpy as np
 
-from .sensing import CameraReading, LidarReading, RGBCamera, read_lidar
+from .sensing import CameraReading, LidarReading
 from .state_model import wrap_angle
-
 
 ARUCO_DICTIONARY = cv2.aruco.DICT_4X4_50
 MARKER_SIZES_M = {0: 0.40, 1: 0.04} # Black square sizes, excluding the white borders
@@ -50,6 +50,9 @@ AMBIGUITY_WARNING = 0.5
 # Reject 3D marker solutions inconsistent with that model before discarding Z/tilt.
 MAX_DOCK_HEIGHT_ERROR_M = 0.05
 MAX_DOCK_TILT_RAD = np.deg2rad(10.0)
+
+# Marker right/up/out maps to dock left/up/out: dock +X is the face normal.
+MARKER_TO_DOCK_ROTATION = np.array([[0, 0, 1], [1, 0, 0], [0, 1, 0]])
 
 # Initial noise assumptions for the demo; tune these using measured errors.
 LIDAR_RANGE_NOISE_STD_M = 0.01
@@ -148,17 +151,6 @@ def transform_to_pose(transform: np.ndarray) -> np.ndarray:
     return np.array([transform[0, 3], transform[1, 3], wrap_angle(heading)])
 
 
-def lidar_transform_from_model(model: mujoco.MjModel) -> np.ndarray:
-    """Read the fixed LiDAR-to-base transform configured before compilation."""
-    # Use the sensor's fixed mount relative to the base, not its changing world pose.
-    mount = model.site("lidar_mount")
-    if mount.bodyid[0] != model.body("base").id:
-        raise ValueError("The LiDAR mounting site must be on the robot base")
-    rotation = np.empty(9)
-    mujoco.mju_quat2Mat(rotation, mount.quat)
-    return make_transform(rotation, mount.pos)
-
-
 def lidar_points_in_base(reading: LidarReading, lidar_to_base: np.ndarray) -> np.ndarray:
     """Convert valid ranges into (N, 2) obstacle points in the robot frame."""
     ranges = np.asarray(reading.ranges_m)
@@ -232,7 +224,10 @@ class ArucoLandmarkDetector:
         dist_coeffs,
         camera_to_base,
         marker_sizes_m: dict[int, float] | None = None,
+        dictionary_id: int = ARUCO_DICTIONARY,
+        *, accept_any_detection: bool = False,
     ) -> None:
+        self.accept_any_detection = accept_any_detection
         self.camera_matrix = np.asarray(camera_matrix, dtype=float)
         # Intrinsics describe image projection; T_base_camera describes the fixed mount.
         self.dist_coeffs = np.asarray(dist_coeffs, dtype=float)
@@ -243,7 +238,7 @@ class ArucoLandmarkDetector:
 
         parameters = cv2.aruco.DetectorParameters()
         parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-        dictionary = cv2.aruco.getPredefinedDictionary(ARUCO_DICTIONARY)
+        dictionary = cv2.aruco.getPredefinedDictionary(dictionary_id)
         self._detector = cv2.aruco.ArucoDetector(dictionary, parameters)
 
     def detect(self, frame: CameraReading) -> list[MarkerObservation]:
@@ -267,7 +262,7 @@ class ArucoLandmarkDetector:
 
         side_px = float(np.mean(np.linalg.norm(corners_px - np.roll(corners_px, -1, axis=0), axis=1)))
         # Very small markers do not provide enough corner detail for a stable pose.
-        if side_px < MIN_MARKER_SIDE_PX:
+        if side_px <= 0 or (not self.accept_any_detection and side_px < MIN_MARKER_SIDE_PX):
             return None
 
         # IPPE requires these corners: top-left, top-right, bottom-right, bottom-left.
@@ -296,7 +291,7 @@ class ArucoLandmarkDetector:
                 solutions.append((float(error), make_transform(rotation, tvec)))
         # Reprojection error measures how well the projected corners match the image.
         solutions.sort(key=lambda solution: solution[0])
-        if not solutions or solutions[0][0] > MAX_REPROJECTION_ERROR_PX:
+        if not solutions or (not self.accept_any_detection and solutions[0][0] > MAX_REPROJECTION_ERROR_PX):
             return None
 
         error, T_camera_marker = solutions[0]
@@ -341,28 +336,38 @@ def marker_mounts() -> dict[int, np.ndarray]:
     Dock +X points out of the charging face; marker +Z points the same way.
     These are physical calibration values, like marker size and camera mounting.
     """
-    rotation = np.array([[0, 0, 1], [1, 0, 0], [0, 1, 0]])
-    return {0: make_transform(rotation, [-.05, 0, .40]),
-            1: make_transform(rotation, [-.025, 0, .12])}
+    return {0: make_transform(MARKER_TO_DOCK_ROTATION, [-.05, 0, .40]),
+            1: make_transform(MARKER_TO_DOCK_ROTATION, [-.025, 0, .12])}
 
 
-def select_dock_observation(markers: list[MarkerObservation]) -> DockObservation | None:
-    """Measure the dock in the CURRENT robot frame, without a world marker map."""
-    mounts = marker_mounts()
+def dock_transform_from_marker(marker, mounts, *, marker_as_dock=False):
+    """Keep the marker's measured centre, or remove its calibrated dock mounting."""
+    mount = (make_transform(MARKER_TO_DOCK_ROTATION, [0, 0, 0]) if marker_as_dock
+             else mounts[marker.marker_id])
+    return marker.T_base_marker @ invert_transform(mount)
+
+
+def select_dock_observation(
+    markers: list[MarkerObservation], mounts: dict[int, np.ndarray] | None = None,
+    *, marker_as_dock: bool = False, accept_any_detection: bool = False,
+) -> DockObservation | None:
+    """Measure a mounted dock, or project an upright marker centre onto the XY plane."""
+    mounts = marker_mounts() if mounts is None else mounts
     # Prefer the marker with more image detail. Both IDs describe the same rigid dock,
     # but we supply only one measurement per image rather than double-counting it.
     for marker in sorted(markers, key=lambda item: (-item.side_px, item.marker_id)):
-        if not marker.orientation_reliable or marker.marker_id not in mounts:
+        if marker.marker_id not in mounts or (not accept_any_detection and not marker.orientation_reliable):
             continue
         # T_base_dock = T_base_marker @ T_marker_dock
         # The inverse mount removes the marker's offset from the dock origin.
-        T_base_dock = marker.T_base_marker @ invert_transform(mounts[marker.marker_id])
+        T_base_dock = dock_transform_from_marker(marker, mounts, marker_as_dock=marker_as_dock)
         if not np.isfinite(T_base_dock).all():
             continue
-        # Check height and tilt before reducing the 3D solution to a planar pose.
-        # Otherwise an incorrect tilted solution could look plausible in XY alone.
+        # Marker-reference mode uses measured XY and face heading, discarding Z.
+        # It requires no mounting height, but still rejects tilted/ambiguous poses.
         tilt = np.arccos(np.clip(T_base_dock[2, 2], -1, 1))
-        if abs(T_base_dock[2, 3]) > MAX_DOCK_HEIGHT_ERROR_M or tilt > MAX_DOCK_TILT_RAD:
+        if not accept_any_detection and ((not marker_as_dock and abs(T_base_dock[2, 3]) > MAX_DOCK_HEIGHT_ERROR_M)
+                                         or tilt > MAX_DOCK_TILT_RAD):
             continue
         pose = transform_to_pose(T_base_dock)
         # Approximate measurement noise from corner uncertainty and apparent size.
@@ -383,19 +388,26 @@ def select_dock_observation(markers: list[MarkerObservation]) -> DockObservation
 
 
 class Perception:
-    """Read sensors and return obstacle points plus any fresh robot-relative dock pose."""
+    """Process HAL readings into obstacle points and fresh robot-relative dock poses."""
 
     def __init__(
         self,
-        model: mujoco.MjModel,
         noise: bool = False,
         rng: np.random.Generator | None = None,
+        *,
+        detector: ArucoLandmarkDetector | None = None,
+        lidar_to_base: np.ndarray | None = None,
+        marker_to_dock: dict[int, np.ndarray] | None = None,
+        marker_as_dock: bool = False,
+        accept_any_detection: bool = False,
     ) -> None:
-        self.lidar_to_base = lidar_transform_from_model(model)
-        self.camera = RGBCamera(model)
-        self.detector = ArucoLandmarkDetector(
-            self.camera.camera_matrix, self.camera.dist_coeffs, self.camera.camera_to_base,
-        )
+        if detector is None or lidar_to_base is None:
+            raise ValueError("Perception requires a detector and LiDAR mounting transform")
+        self.detector = detector
+        self.lidar_to_base = np.array(lidar_to_base, copy=True)
+        self.marker_to_dock = marker_mounts() if marker_to_dock is None else marker_to_dock
+        self.marker_as_dock = marker_as_dock
+        self.accept_any_detection = accept_any_detection
         self.noise = noise
         self.rng = rng if rng is not None else np.random.default_rng()
         self._scan: LidarReading | None = None
@@ -403,9 +415,8 @@ class Perception:
         self._frame: CameraReading | None = None
         self._last_update_time: float | None = None
 
-    def update(self, data: mujoco.MjData) -> PerceptionOutput:
-        """Process each sensor sample once, using its acquisition timestamp."""
-        now = float(data.time)
+    def process(self, now: float, scan: LidarReading, frame: CameraReading) -> PerceptionOutput:
+        """Process shared sensor snapshots once per acquisition, without simulator state."""
         # Discard cached readings if the simulation clock has been reset.
         if self._last_update_time is not None and now < self._last_update_time:
             self._scan = None
@@ -414,13 +425,10 @@ class Perception:
 
         # Sensors and control may run at different rates. Cache each scan and apply
         # simulated noise once per acquisition, not again on every control update.
-        scan_time = float(data.sensor('lidar_time').data[0])
-        if self._scan is None or scan_time != self._scan.time:
-            scan = read_lidar(data)
+        if self._scan is None or scan.time != self._scan.time:
             self._scan = add_lidar_noise(scan, self.rng) if self.noise else scan
             self._points = lidar_points_in_base(self._scan, self.lidar_to_base)
 
-        frame = self.camera.read(data)
         new_frame = self._frame is None or frame.time != self._frame.time
         # Cached images can still be displayed, but must not become repeated EKF
         # corrections. Only new frames yield a pose.
@@ -429,7 +437,9 @@ class Perception:
         if new_frame:
             self._frame = add_camera_noise(frame, self.rng) if self.noise else frame
             markers = self.detector.detect(self._frame)
-            dock_observation = select_dock_observation(markers)
+            dock_observation = select_dock_observation(markers, self.marker_to_dock,
+                                                       marker_as_dock=self.marker_as_dock,
+                                                       accept_any_detection=self.accept_any_detection)
 
         return PerceptionOutput(
             time=now,
@@ -440,13 +450,3 @@ class Perception:
             new_camera_frame=new_frame,
             dock_observation=dock_observation,
         )
-
-    def close(self) -> None:
-        """Release the camera renderer when the simulation finishes."""
-        self.camera.close()
-
-    def __enter__(self) -> "Perception":
-        return self
-
-    def __exit__(self, *exc) -> None:
-        self.close()

@@ -1,0 +1,137 @@
+# Standard TurtleBot3 Waffle Pi with the original camera and LiDAR mounts.
+# Camera intrinsics are from the 20261103-134652-132350 calibration at 640x480.
+# The upright marker itself is the planar dock reference; supply the robot host.
+# Manufacturer sources and remaining setup steps are listed in README.md.
+# Transform convention: to_base maps sensor coordinates into robot base coordinates;
+# to_dock maps marker coordinates into dock coordinates. Base is base_footprint:
+# on the floor beneath the axle, X forward, Y left, Z up.
+connection:
+  host: null  # Or supply --host on the command line.
+  port: 9090
+  topics:
+    cmd_vel: /cmd_vel
+    image: /camera/image_raw/compressed
+    laser_scan: /scan
+    joint_states: /joint_states
+
+wheels:
+  joint_names: [wheel_left_joint, wheel_right_joint]  # Verify against /joint_states.
+  joint_signs: [1, 1]  # Positive angles must drive each side forward.
+  encoder_noise_std_rad: [0.001, 0.001]  # Initial assumptions; tune from measurements.
+  encoders_wrap: false  # Set true ONLY if positions wrap at +/-pi or 2pi.
+  drive:
+    wheel_radius_m: 0.033
+    wheel_separation_m: 0.287  # ROBOTIS driver value; URDF wheel centres span 0.288 m.
+    max_wheel_speed_rad_s: 7.88  # Approximately 0.26 m/s / 0.033 m wheel radius.
+    pbvs_min_speed_mps: 0.0  # No simulation friction compensation on hardware.
+    pbvs_min_turn_rad_s: 0.0
+
+camera:
+  image_size: [640, 480]  # Must match the resolution used for calibration.
+  matrix:  # Raw-image intrinsic matrix K.
+    - [1248.8480953176243, 0.0, 329.6234493172563]
+    - [0.0, 1248.3947153994363, 220.62200144165917]
+    - [0.0, 0.0, 1.0]
+  dist_coeffs:  # OpenCV order: k1, k2, p1, p2, k3.
+    - 0.06408530637043043
+    - 0.6295677759243083
+    - -0.0016391459164168242
+    - -0.0005910171496460174
+    - -3.2963778870302916
+  # Stock URDF chain: base_footprint -> base_link -> camera_link -> camera_rgb_frame
+  # -> camera_rgb_optical_frame. Translation includes the 0.010 m base_link height.
+  # Nominal optical rotation uses exact quarter turns (URDF rounds them to 1.57 rad).
+  to_base:
+    - [0,  0, 1, 0.076]
+    - [-1, 0, 0, 0.0]
+    - [0, -1, 0, 0.103]
+    - [0,  0, 0, 1]
+  frame_id: ""  # Optional name check; stock optical frame is camera_rgb_optical_frame.
+
+lidar:
+  # Trial override: keep scans/logging, disable obstacle stops and route detours.
+  obstacle_checks_enabled: false
+  # Stock URDF base_scan -> base_footprint; scan zero angle points forward.
+  to_base:
+    - [1, 0, 0, -0.064]
+    - [0, 1, 0, 0.0]
+    - [0, 0, 1, 0.132]
+    - [0, 0, 0, 1]
+  frame_id: ""  # Optional name check; stock scan frame is base_scan.
+  # Trial convention: ignore exact zeros as no-return beams, like +infinity.
+  # This is a driver assumption, not proof of free space. Other invalid returns stop.
+  zero_is_no_return: true
+
+markers:
+  # Dock at the marker centre's XY position, approaching along its face normal.
+  # Upright marker required; no measured floor height or mounting translation.
+  reference: marker
+  accept_any_detection: true  # Use the best finite pose; no quality/ambiguity/outlier gates.
+  dictionary: DICT_4X4_50
+  definitions:
+    - id: 0
+      size_m: 0.080  # 80 mm black square width, excluding the white border.
+
+# All source headers must use the same robot clock, with advancing nonzero stamps.
+# Local elapsed time is anchored at the first observed encoder stamp. See README
+# for the initial transport-delay limitation and robot-side command timeout.
+timing:
+  # Allow up to 1.2 s source/arrival delay; stop and wait beyond this.
+  # Finite limits remain: frozen or increasingly delayed streams still stop motion.
+  encoder_timeout_s: 1.2
+  camera_timeout_s: 1.2
+  startup_timeout_s: 10.0  # Connection setup only; missing sensors wait indefinitely.
+  history_s: 3.0
+  max_encoder_gap_s: 1.2  # Larger gaps reset pose; require a new marker fix after acquisition.
+  command_timeout_s: 0.3
+  future_tolerance_s: 0.1
+
+estimation:
+  update_hz: 10.0  # Hardware control/polling rate; does not throttle ROS publishers.
+  noise_seed: 0  # Shared config field; hardware adds no artificial sensor noise.
+  process_position_std_m_per_sqrt_s: 0.01
+  process_heading_std_deg_per_sqrt_s: 2.0
+
+navigation:
+  # Hardware NAVIGATE: LQI reaches this offset position AND faces the dock.
+  # Handover tolerances apply to both estimated and fresh camera-measured pose.
+  coarse_distance_m: 0.5
+  offset_position_tolerance_m: 0.10  # 10 cm planar error at the offset pose.
+  offset_heading_tolerance_deg: 10.0
+  coarse_tolerance_m: 0.25  # Legacy multistage field; unused by hardware's two phases.
+  # PBVS requires this many distinct accepted frames within this age window.
+  # New images without a usable marker stop PBVS immediately.
+  reacquire_heading_tolerance_deg: 10.0
+  reacquire_observation_age_s: 0.5
+  reacquire_confirmations: 1
+  reacquire_wait_s: 1.0  # Wait, then spin at half turn_speed_rad_s until marker returns.
+  reacquire_sweep_deg: 30.0
+  reacquire_timeout_s: 30.0
+  # Legacy intermediate ALIGN target/speed; unused by hardware's two phases.
+  pbvs_speed_mps: 0.08
+  approach_distance_m: 0.3
+  # Hardware DOCK: PBVS goes directly to this final offset at dock_speed_mps.
+  dock_distance_m: 0.25
+  # Restored earlier hardware speeds; keep final docking slower for precision.
+  # These are command limits, so ramps, turns and wheel limits can reduce speed.
+  drive_speed_mps: 0.10
+  dock_speed_mps: 0.04
+  turn_speed_rad_s: 0.3
+  clearance_m: 0.2
+  position_tolerance_m: 0.10  # Final docking: 10 cm planar error.
+  heading_tolerance_deg: 10.0  # Final docking: 10 degrees.
+  # Travel uses encoder prediction during marker loss; no separate reacquisition gate.
+  lidar_timeout_s: 1.2
+  # Initial random search: each turn/drive lasts 50-100% of these limits.
+  # Random clockwise/anticlockwise spot turns; straight travel only if clear.
+  search_spin_s: 6.0
+  search_drive_s: 3.0
+  # Stop/report if estimated position fails to progress during boundary following.
+  progress_timeout_s: 30.0
+  # Follow one side of a LiDAR cluster until the goal corridor clears.
+  # Connect neighbouring returns up to this gap; physical clearance stays separate.
+  boundary_join_gap_m: 0.8
+  detour_step_m: 0.4
+  detour_speed_mps: 0.08
+  # Total time budget for obstacle detours, independent of marker visibility.
+  detour_timeout_s: 180.0

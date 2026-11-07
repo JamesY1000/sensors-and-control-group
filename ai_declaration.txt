@@ -9,6 +9,10 @@ James Y:
 - Helped with the main mujoco simulation routine syntax and accessing/rendering the sensors
 - Added a display window inside Mujoco GUI for the simulated camera, marker detections, generated trajectory and detected obstacles
 - Identified that the chassis collision in the urdf was scraping the floor, causing massive heading errors in odometry
+- Helped with building HAL into current modules/components
+- Helped consolidate the demo into HAL, simulation and hardware packages and remove unused/unnecessary scripts/tests
+- Helped compare intrinsic parameters obtained from different runs with the camera calibration script
+- Helped with creating hardware tests, and helping resolve issues such as the msg timing/polling delays due to turtlebot hardware limitations
 
 Nikhil K:
 

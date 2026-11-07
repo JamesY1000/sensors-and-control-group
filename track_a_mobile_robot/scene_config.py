@@ -134,8 +134,8 @@ class NavigationConfig:
             raise ValueError("Heading tolerance must be less than 90 degrees")
         if not self.heading_tolerance_deg <= self.reacquire_heading_tolerance_deg < 90:
             raise ValueError("Reacquisition heading tolerance must be between docking tolerance and 90 degrees")
-        if not isinstance(self.reacquire_confirmations, int) or self.reacquire_confirmations < 2:
-            raise ValueError("Reacquisition requires at least two distinct camera observations")
+        if type(self.reacquire_confirmations) is not int or self.reacquire_confirmations < 1:
+            raise ValueError("Reacquisition requires at least one camera observation")
         if self.reacquire_sweep_deg >= 90:
             raise ValueError("Reacquisition sweep must be less than 90 degrees on each side")
         if self.reacquire_timeout_s <= self.reacquire_wait_s:
