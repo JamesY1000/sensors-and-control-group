@@ -131,6 +131,7 @@ class MotionController:
         self._integral = 0.
         self._previous_time = None
         self._segment = None
+        self.tracking_error = None
 
     def _limited_command(self, time, v, omega):
         return limited_command(time, v, omega, self.drive)
@@ -212,6 +213,7 @@ class MotionController:
         self._previous_time = time
 
         error = trajectory_error(state.pose_local, reference.pose_local)
+        self.tracking_error = tuple(float(value) for value in error)
         if reference.kind == 'TURN':
             return self._turn_lqi_command(time, reference, error[2], dt)
         return self._drive_lqi_command(time, reference, error, dt, request.speed_limit_mps)

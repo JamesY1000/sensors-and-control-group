@@ -44,14 +44,21 @@ from .state_model import DifferentialDriveModel, wrap_angle
 CAMERA_INNOVATION_LIMIT = 11.345 # 99% chi-squared threshold, three components
 
 
-def create_estimator(settings, model, encoder_noise_std_rad, *, gate_camera=True):
-    """Construct the shared EKF from update settings and encoder calibration."""
+def create_estimator(settings, model, encoder_noise_std_rad, *, gate_camera=True, method='ekf'):
+    """Construct a filter with the same model, noise assumptions and camera gate."""
     process_std = np.array([
         settings.process_position_std_m_per_sqrt_s,
         settings.process_position_std_m_per_sqrt_s,
         np.deg2rad(settings.process_heading_std_deg_per_sqrt_s),
     ])
-    return PoseEstimator(model, encoder_noise_std_rad, np.diag(process_std**2), gate_camera=gate_camera)
+    if method == 'ekf':
+        cls = PoseEstimator
+    elif method == 'ukf':
+        from .estimation_ukf import UnscentedPoseEstimator
+        cls = UnscentedPoseEstimator
+    else:
+        raise ValueError('Estimator must be ekf or ukf')
+    return cls(model, encoder_noise_std_rad, np.diag(process_std**2), gate_camera=gate_camera)
 
 
 @dataclass(frozen=True)

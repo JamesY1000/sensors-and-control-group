@@ -44,6 +44,7 @@ def read_noisy_wheel_encoders(
     model: mujoco.MjModel,
     data: mujoco.MjData,
     rng: np.random.Generator,
+    noise_scale: float = 1.,
 ) -> WheelEncoderReading:
     """Take a new sample with independent, zero-mean Gaussian angle errors.
 
@@ -58,8 +59,8 @@ def read_noisy_wheel_encoders(
 
     left_encoder_id = model.sensor("wheel_left_encoder").id
     right_encoder_id = model.sensor("wheel_right_encoder").id
-    left_encoder_std = float(model.sensor_noise[left_encoder_id])
-    right_encoder_std = float(model.sensor_noise[right_encoder_id])
+    left_encoder_std = noise_scale * float(model.sensor_noise[left_encoder_id])
+    right_encoder_std = noise_scale * float(model.sensor_noise[right_encoder_id])
 
     left_encoder_noisy = encoders_true.left_encoder_rad + float(rng.normal(0.0, left_encoder_std))
     right_encoder_noisy = encoders_true.right_encoder_rad + float(rng.normal(0.0, right_encoder_std))
@@ -196,8 +197,11 @@ class MujocoBackend:
     Only static sensor calibration is exposed to the autonomy pipeline.
     """
 
-    def __init__(self, model: mujoco.MjModel, data: mujoco.MjData, *, rng=None):
+    def __init__(self, model: mujoco.MjModel, data: mujoco.MjData, *, rng=None, encoder_noise_scale=1.):
         self.model, self.data = model, data
+        if not np.isfinite(encoder_noise_scale) or encoder_noise_scale <= 0:
+            raise ValueError('Encoder noise scale must be positive and finite')
+        self.encoder_noise_scale = float(encoder_noise_scale)
         self.rng = rng if rng is not None else np.random.default_rng()
         self.lidar_to_base = lidar_transform_from_model(model)
         self.encoder_noise_std_rad = tuple(
@@ -227,7 +231,7 @@ class MujocoBackend:
         new_encoder = None
         # Sampling twice at the same timestamp must not invent fresh encoder noise.
         if self.encoders is None or now != self.encoders.time:
-            new_encoder = self.encoders = read_noisy_wheel_encoders(self.model, self.data, self.rng)
+            new_encoder = self.encoders = read_noisy_wheel_encoders(self.model, self.data, self.rng, self.encoder_noise_scale)
         scan_time = float(self.data.sensor("lidar_time").data[0])
         if self.lidar is None or reset or scan_time != self.lidar.time:
             self.lidar = read_lidar(self.data)
